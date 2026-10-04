@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+# tests/manual/ holds run-by-hand client scripts; they connect to a live server
+# at import time and must never be collected.
+norecursedirs = ["tests/manual", ".venv", "voice_samples", ".pytest_cache"]

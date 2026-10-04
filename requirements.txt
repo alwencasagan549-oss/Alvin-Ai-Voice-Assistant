@@ -1,0 +1,13 @@
+fastapi~=0.142.2
+uvicorn[standard]~=0.54.0
+faster-whisper~=1.2.1
+silero-vad~=6.2.3
+python-dotenv~=1.2.4
+edge-tts~=7.2.8
+miniaudio~=1.71
+soundfile~=0.14.0
+groq~=1.7.0
+numpy~=2.5.3
+openai~=1.68.0
+sounddevice>=0.5.1
+websockets>=15.0
