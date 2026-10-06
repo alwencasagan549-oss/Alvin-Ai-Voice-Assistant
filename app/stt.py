@@ -374,35 +374,41 @@ class STTService:
         audio_seconds = audio.size / settings.sample_rate
         timeout = breaker_timeout(audio_seconds)
 
-        try:
-            if settings.groq_fallback:
+        if settings.groq_fallback:
+            try:
                 result = await asyncio.wait_for(
                     groq_backend.transcribe_async(audio, language),
                     timeout=timeout,
                 )
-            else:
-                result = await groq_backend.transcribe_async(audio, language)
-        except asyncio.TimeoutError:
-            log.warning(
-                "Groq STT timeout (%.1fs for %.1fs of audio), falling back to local %s",
-                timeout,
-                audio_seconds,
-                settings.fallback_model,
-            )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "Groq STT timeout (%.1fs for %.1fs of audio), falling back to local %s",
+                    timeout,
+                    audio_seconds,
+                    settings.fallback_model,
+                )
+                local_backend = self._get_local_backend()
+                if local_backend.model is None:
+                    await local_backend.ensure_loaded()
+                result = await local_backend.transcribe_async(audio, language)
+                log.info("Fallback transcription succeeded")
+            except Exception:  # noqa: BLE001 - any Groq failure must fall back
+                log.warning(
+                    "Groq STT error, falling back to local %s", settings.fallback_model
+                )
+                local_backend = self._get_local_backend()
+                if local_backend.model is None:
+                    await local_backend.ensure_loaded()
+                result = await local_backend.transcribe_async(audio, language)
+                log.info("Fallback transcription succeeded")
+        else:
+            # Groq explicitly disabled - use local backend directly
+            log.debug("Groq disabled, using local backend")
             local_backend = self._get_local_backend()
             if local_backend.model is None:
                 await local_backend.ensure_loaded()
             result = await local_backend.transcribe_async(audio, language)
-            log.info("Fallback transcription succeeded")
-        except Exception:  # noqa: BLE001 - any Groq failure must fall back
-            log.warning(
-                "Groq STT error, falling back to local %s", settings.fallback_model
-            )
-            local_backend = self._get_local_backend()
-            if local_backend.model is None:
-                await local_backend.ensure_loaded()
-            result = await local_backend.transcribe_async(audio, language)
-            log.info("Fallback transcription succeeded")
+            log.info("Local transcription succeeded")
 
         log.debug(
             "STT [%s] latency=%.1fms confidence=%.3f text=%r",

@@ -63,6 +63,22 @@ _MD_LIST = re.compile(r"^\s*[-*] ", re.MULTILINE)
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+|\n+")
 
 
+
+def _chunk_delta(chunk) -> str:
+    """Extract the text delta from a streamed chunk, tolerating empty ones.
+
+    Gateways occasionally emit a chunk with no choices (keep-alives, usage-only
+    frames, or the first frame of a stream). Indexing ``chunk.choices[0]``
+    unguarded raised ``IndexError`` there and killed the whole turn, showing up
+    as an intermittent ``llm_error`` on models that are otherwise fastest.
+    """
+    choices = getattr(chunk, "choices", None)
+    if not choices:
+        return ""
+    delta = getattr(choices[0], "delta", None)
+    return getattr(delta, "content", None) or ""
+
+
 def sanitize_for_voice(text: str) -> str:
     """Strip thinking blocks, Markdown, and code artifacts from LLM output.
 
@@ -130,6 +146,63 @@ class LLMResult:
 
 
 # --- service ------------------------------------------------------------- #
+
+class ConversationHistory(list):
+    """A self-trimming conversation history with the system prompt pinned.
+
+    A plain ``list`` only respected ``MAX_LLM_HISTORY`` because each code path
+    remembered to trim after appending. Any new append site (or a test poking at
+    ``history`` directly) could silently grow the context without bound, which
+    inflates latency and token cost every turn. Making the container enforce the
+    cap turns that into a structural guarantee: the oldest non-system messages
+    are evicted as soon as the limit is exceeded.
+
+    ``list`` semantics are preserved so existing code (and tests) can keep using
+    ``append``, ``extend``, indexing, and slicing.
+    """
+
+    def __init__(
+        self, iterable: object = (), *, max_history: int | None = None
+    ) -> None:
+        super().__init__(iterable)
+        self.max_history = max_history
+        self._trim()
+
+    def _trim(self) -> None:
+        """Evict oldest non-system messages until within ``max_history``."""
+        if self.max_history is None or len(self) <= self.max_history:
+            return
+        # Keep index 0 (the system prompt) plus the newest (max_history - 1)
+        # messages, never dropping the system prompt itself.
+        overflow = len(self) - self.max_history
+        if overflow > 0:
+            del self[1 : 1 + overflow]
+
+    def append(self, message) -> None:  # type: ignore[override]
+        super().append(message)
+        self._trim()
+
+    def extend(self, messages) -> None:  # type: ignore[override]
+        super().extend(messages)
+        self._trim()
+
+    def __add__(self, other):
+        result = ConversationHistory(
+            list(self) + list(other), max_history=self.max_history
+        )
+        return result
+
+    def __radd__(self, other):
+        return ConversationHistory(
+            list(other) + list(self), max_history=self.max_history
+        )
+
+    def trimmed_copy(self, max_history: int | None = None) -> ConversationHistory:
+        """Return a trimmed copy, optionally with a different cap."""
+        cap = self.max_history if max_history is None else max_history
+        return ConversationHistory(list(self), max_history=cap)
+
+
 class LLMService:
     """Conversational brain with streaming, multi-provider fallback.
 
@@ -199,6 +272,11 @@ class LLMService:
             and bool(settings.cf_api_key)
             and bool(settings.cf_account_id)
         )
+
+    @property
+    def use_cf_as_primary(self) -> bool:
+        """True when Cloudflare should be used as primary LLM provider."""
+        return settings.llm_use_cf_as_primary and self.cf_enabled
 
     @property
     def model(self) -> str:
@@ -283,6 +361,13 @@ class LLMService:
             RuntimeError: when the LLM is disabled or returns no content.
             asyncio.TimeoutError: when the call exceeds ``LLM_TIMEOUT_SEC``.
         """
+        # Use Cloudflare as primary if configured
+        if self.use_cf_as_primary:
+            return await self._generate_cf_response(
+                messages or [{"role": "system", "content": settings.llm_system_prompt}, {"role": "user", "content": text}],
+                max_tokens, temperature
+            )
+
         client = self._get_client()
         if client is None:
             raise RuntimeError("LLM service is not configured (no API key)")
@@ -430,6 +515,18 @@ class LLMService:
             ``(sentence, model_name)`` tuples where ``model_name`` is the id of
             the provider that actually generated the sentence (primary or cf).
         """
+        # Use Cloudflare as primary if configured
+        if self.use_cf_as_primary:
+            try:
+                async for sentence, model in self._stream_cloudflare(
+                    messages, max_tokens, temperature
+                ):
+                    yield sentence, model
+                return
+            except Exception as exc:
+                log.error("Cloudflare primary streaming failed: %s", exc)
+                # Fall through to fallback_text
+
         primary_count = 0
         try:
             async for sentence, model in self._stream_primary(

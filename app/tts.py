@@ -98,55 +98,42 @@ def clean_text_for_tts(text: str) -> str:
     text = _MARKDOWN_BOLD.sub(r"\1", text)
     text = _MARKDOWN_ITALIC.sub(r"\1", text)
     text = _MARKDOWN_HEADING.sub("", text)
-    text = _URL.sub("", text)
-    text = _EMOJI.sub("", text)
-
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    text = _URL.sub(" ", text)  # Replace URL with space to separate words
+    text = _EMOJI.sub(" ", text)  # Replace emoji with space
+    # Replace newlines with spaces for clean TTS
+    text = text.replace("\n", " ")
+    # Collapse multiple spaces
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 def chunk_sentences(text: str) -> list[str]:
-    """Split text into sentence-like chunks for streaming TTS."""
+    """Split text into sentences for streaming TTS."""
     if not text:
         return []
-
-    text = text.strip()
-    if not text:
-        return []
-
-    parts = _SENTENCE_END.split(text)
-    chunks = [p.strip() for p in parts if p.strip()]
-    return chunks
+    parts = _SENTENCE_END.split(text.strip())
+    return [p.strip() for p in parts if p.strip()]
 
 
 def dbfs_to_amplitude(dbfs: float) -> int:
-    """Convert a dBFS threshold to an int16 amplitude."""
-    return max(1, min(32767, int(32768 * (10 ** (dbfs / 20)))))
+    """Convert dBFS threshold to 16-bit PCM amplitude."""
+    return int(32767 * 10 ** (dbfs / 20.0))
 
 
-def silence_gap_bytes(gap_ms: float) -> bytes:
-    """Digital silence used to join two trimmed sentences."""
-    frames = int(gap_ms * TARGET_SAMPLE_RATE / 1000)
-    return np.zeros(frames, dtype=_PCM_DTYPE).tobytes()
-
-
-def _decode_mp3(mp3: bytes) -> np.ndarray:
-    """Decode MP3 to 16 kHz / signed 16-bit / mono samples."""
-    decoded = miniaudio.decode(
-        mp3,
-        output_format=miniaudio.SampleFormat.SIGNED16,
-        nchannels=TARGET_CHANNELS,
-        sample_rate=TARGET_SAMPLE_RATE,
-    )
-    return np.frombuffer(decoded.samples.tobytes(), dtype=_PCM_DTYPE)
+def silence_gap_bytes(ms: int) -> bytes:
+    """Return ``ms`` milliseconds of digital silence at 16 kHz mono 16-bit."""
+    if ms <= 0:
+        return b""
+    frames = TARGET_SAMPLE_RATE * ms // 1000
+    return b"\x00" * (frames * 2)
 
 
 class EdgeSilenceTrimmer:
-    """Drops the silence at both ends of a sentence while it streams.
+    """Incrementally drops leading/trailing silence below a threshold.
 
-    Frames quieter than ``threshold`` are considered silence. Leading silence is
-    dropped immediately; a rolling ``hold`` window of the tail is kept back so
-    end-of-sentence silence can still be discarded by :meth:`flush`.
+    Leading silence is suppressed until the first frame exceeds the threshold.
+    Trailing silence is held back by ``hold`` frames and only emitted if it
+    contains speech; otherwise it is dropped.
     """
 
     def __init__(self, threshold: int, hold: int) -> None:
@@ -259,19 +246,39 @@ async def _fetch_sentence_mp3(
     """
     retries = settings.tts_retries if retries is None else retries
     backoff_ms = settings.tts_retry_backoff_ms if backoff_ms is None else backoff_ms
+    timeout_sec = getattr(settings, 'tts_timeout_sec', 10.0)
     try:
         last_exc: BaseException | None = None
         got_audio = False
         for attempt in range(retries + 1):
             try:
                 communicate = edge_tts.Communicate(sentence, voice)
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        queue.put_nowait(chunk["data"])
-                        got_audio = True
+                stream = communicate.stream()
+
+                async def _consume():
+                    nonlocal got_audio
+                    async for chunk in stream:
+                        if chunk["type"] == "audio":
+                            queue.put_nowait(chunk["data"])
+                            got_audio = True
+
+                consume_task = asyncio.create_task(_consume())
+                try:
+                    await asyncio.wait_for(consume_task, timeout=timeout_sec)
+                except asyncio.TimeoutError:
+                    consume_task.cancel()
+                    raise asyncio.TimeoutError(f"TTS timeout after {timeout_sec}s")
                 return  # fully streamed; nothing left to do
             except asyncio.CancelledError:
                 raise
+            except asyncio.TimeoutError as exc:
+                last_exc = exc
+                log.warning(
+                    "edge-tts attempt %d/%d timed out for %r",
+                    attempt + 1,
+                    retries + 1,
+                    sentence[:60],
+                )
             except Exception as exc:  # noqa: BLE001 - retry, then forward
                 last_exc = exc
                 log.warning(
@@ -281,11 +288,11 @@ async def _fetch_sentence_mp3(
                     sentence[:60],
                     exc,
                 )
-                # Only restart when nothing was emitted yet, so a retry can't
-                # double-speak a sentence that already partially streamed.
-                if got_audio or attempt >= retries:
-                    break
-                await asyncio.sleep(backoff_ms / 1000.0)
+            # Only restart when nothing was emitted yet, so a retry can't
+            # double-speak a sentence that already partially streamed.
+            if got_audio or attempt >= retries:
+                break
+            await asyncio.sleep(backoff_ms / 1000.0)
         if last_exc is not None:
             queue.put_nowait(last_exc)
     finally:
@@ -378,118 +385,95 @@ async def synthesize_stream(
                 _fetch_sentence_mp3(sentences[index], voice, queues[index])
             )
 
-    spoken_any = False
+    # Start the first `window` producers.
+    for i in range(min(window, len(sentences))):
+        spawn(i)
+
     try:
-        for index in range(min(window, len(sentences))):
-            spawn(index)
-
-        for index, sentence in enumerate(sentences):
-            spawn(index + window)  # keep the prefetch window full
-            queue = queues[index]
+        for index in range(len(sentences)):
+            # Wait for the next producer to finish (or fail).
+            if index in producers:
+                await producers[index]
+            # Drain this sentence's queue.
             assembler = _PcmAssembler(
-                threshold, hold, settings.tts_decode_interval_bytes
+                threshold=threshold,
+                hold=hold,
+                interval_bytes=settings.tts_decode_interval_bytes,
             )
-            # The joining gap belongs between sentences, not between the chunks
-            # a single sentence is decoded into.
-            sentence_started = False
-
-            async def emit(frames: bytes):
-                """Yield PCM, prefixing the first frame of each sentence."""
-                nonlocal spoken_any, sentence_started
-                if spoken_any and not sentence_started and gap:
-                    yield gap
-                if frames:
-                    spoken_any = True
-                    sentence_started = True
-                    yield frames
-
-            failed: BaseException | None = None
+            q = queues[index]
             while True:
-                item = await queue.get()
+                item = await q.get()
                 if item is _SENTENCE_DONE:
                     break
                 if isinstance(item, Exception):
-                    failed = item
+                    yield _error_event(item, index, sentences[index])
+                    # Skip to next sentence on failure.
                     break
                 out = await assembler.push(item)
                 if out:
-                    async for frame in emit(out):
-                        yield frame
-
-            if failed is None:
-                out = await assembler.finish()
-                if out:
-                    async for frame in emit(out):
-                        yield frame
-            else:
-                log.warning("TTS failed for sentence %d: %s", index, failed)
-                yield _error_event(failed, index, sentence)
+                    yield out
+            # Flush any held audio for this sentence.
+            tail = await assembler.finish()
+            if tail:
+                yield tail
+            # Emit gap silence between sentences (except after the last).
+            if index + 1 < len(sentences) and gap:
+                yield gap
+            # Start the next producer if we're still within the window.
+            if index + window < len(sentences):
+                spawn(index + window)
     finally:
+        # Cancel any outstanding producers.
         for task in producers.values():
-            if not task.done():
-                task.cancel()
-        if producers:
-            await asyncio.gather(*producers.values(), return_exceptions=True)
-        # Clear the producers dict to release task references
-        producers.clear()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 - cleanup must never raise
+                log.warning("error cleaning up TTS producer task")
 
 
-async def synthesize_pcm(
-    text: str,
-    voice: str | None = None,
-    prefetch: int | None = None,
-) -> AsyncGenerator[bytes, None]:
-    """Like :func:`synthesize_stream` but raises instead of yielding errors."""
-    async for item in synthesize_stream(text, voice, prefetch):
-        if isinstance(item, dict):
-            raise TTSSynthesisError(item)
-        yield item
+def _decode_mp3(mp3_bytes: bytes) -> np.ndarray:
+    """Decode MP3 to 16 kHz mono 16-bit PCM using miniaudio."""
+    if not mp3_bytes:
+        return np.empty(0, dtype=_PCM_DTYPE)
+    decoded = miniaudio.decode(
+        mp3_bytes,
+        output_format=miniaudio.SampleFormat.SIGNED16,
+        nchannels=TARGET_CHANNELS,
+        sample_rate=TARGET_SAMPLE_RATE,
+    )
+    # decoded.samples is an array.array, convert to numpy
+    return np.frombuffer(decoded.samples, dtype=_PCM_DTYPE)
+
+
+def synthesize_pcm(text: str, voice: str | None = None):
+    """Synthesize full text to PCM frames, raising on error events.
+
+    This is a compatibility wrapper that yields frames and raises
+    :class:`TTSSynthesisError` when an error event is encountered.
+    """
+    async def _gen():
+        async for chunk in synthesize_stream(text, voice):
+            if isinstance(chunk, bytes):
+                yield chunk
+            elif isinstance(chunk, dict) and chunk.get("type") == "error":
+                raise TTSSynthesisError(chunk)
+
+    return _gen()
 
 
 async def warm_up(voice: str | None = None) -> bool:
-    """Synthesize and discard one tiny phrase to prime the TTS path.
-
-    The first edge-tts request in a process pays a one-off cost -- endpoint
-    setup, TLS, and the first progressive MP3 decode -- measured at roughly
-    +0.3-0.6 s of time-to-first-audio. Running that during service startup
-    keeps it off the first user turn.
-
-    Note that each sentence opens its own edge-tts connection, so this does not
-    pool connections: it removes the cold-start cost from the request path, not
-    per-sentence overhead. Returns ``True`` when audio actually came back and
-    never raises; a failed warm-up only means the first turn is slower.
-    """
-    start = time.perf_counter()
-    audio_bytes = 0
-    errors = 0
+    """Pre-warm the TTS pipeline at startup so the first real turn is fast."""
     try:
-        async for item in synthesize_stream(WARMUP_TEXT, voice):
-            if isinstance(item, dict):
-                errors += 1
-                continue
-            audio_bytes += len(item)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - warm-up is best effort
-        log.warning(
-            "TTS warm-up failed (%s: %s); the first turn pays the cold start",
-            type(exc).__name__,
-            exc,
-        )
+        async for chunk in synthesize_stream(WARMUP_TEXT, voice or settings.tts_voice):
+            # Check for error events from synthesize_stream
+            if isinstance(chunk, dict) and chunk.get("type") == "error":
+                log.warning("TTS warm-up error event: %s", chunk.get("message"))
+                return False
+        log.info("TTS warm-up completed")
+        return True
+    except Exception as exc:  # noqa: BLE001 - warm-up is best-effort
+        log.warning("TTS warm-up failed: %s", exc)
         return False
-
-    if not audio_bytes:
-        log.warning(
-            "TTS warm-up produced no audio (%d error event(s)); the first turn "
-            "pays the cold start",
-            errors,
-        )
-        return False
-
-    log.info(
-        "TTS warm in %.0f ms (%s, %d bytes discarded)",
-        (time.perf_counter() - start) * 1000,
-        voice or settings.tts_voice,
-        audio_bytes,
-    )
-    return True

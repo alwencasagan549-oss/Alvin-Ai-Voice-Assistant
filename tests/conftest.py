@@ -43,6 +43,10 @@ os.environ.setdefault("MIN_SEGMENT_SECONDS", "0.3")
 os.environ.setdefault("MAX_SEGMENT_SECONDS", "20")
 # Keep the server subprocess offline: the startup warm-up is a real cloud call.
 os.environ.setdefault("GROQ_WARMUP", "false")
+# Explicitly disable Groq for integration tests (overrides .env)
+os.environ["GROQ_FALLBACK"] = "false"
+os.environ["GROQ_API_KEY"] = ""
+
 
 
 def _free_port() -> int:
@@ -72,6 +76,14 @@ def _wait_ready(port: int, timeout: float = 120.0) -> None:
 def server_url() -> str:
     """Start a uvicorn subprocess and yield its /ws/transcribe URL."""
     port = _free_port()
+    # Explicitly disable Groq in subprocess (overrides .env)
+    env = os.environ.copy()
+    env["GROQ_FALLBACK"] = "false"
+    env["GROQ_API_KEY"] = ""
+    env["GROQ_WARMUP"] = "false"
+    # Lower VAD threshold for test audio (attenuated to 55% volume)
+    env["VAD_THRESHOLD"] = "0.3"
+    
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -88,7 +100,7 @@ def server_url() -> str:
             "warning",
         ],
         cwd=str(ROOT),
-        env=os.environ.copy(),
+        env=env,
     )
     try:
         _wait_ready(port)

@@ -79,6 +79,12 @@ def main() -> None:
         help="Consecutive speech frames to trigger barge-in flush (default: 2)",
     )
     parser.add_argument("--port", type=int, default=None, help="Server port")
+    parser.add_argument(
+        "--ptt-mode",
+        choices=["global", "console"],
+        default="console",
+        help="PTT hotkey mode: 'global' (Shift+Z, requires admin), 'console' (Enter key, no admin)",
+    )
     args = parser.parse_args()
 
     if args.mic:
@@ -144,6 +150,7 @@ def main() -> None:
                     args.voice,
                     args.vad_threshold,
                     args.vad_frames,
+                    args.ptt_mode,
                 )
             )
         except KeyboardInterrupt:

@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse
 from .config import settings
 from .connection import Connection, manager, verify_token
 from .llm import llm_service
+from .intents import SUPPORTED_INTENTS
 from .stt import stt_service
 from .tts import warm_up as tts_warm_up
 from .vad import VADStreamDetector
@@ -152,6 +153,24 @@ async def health() -> JSONResponse:
                     if llm_service.cf_enabled
                     else None
                 ),
+            },
+            "intents": {
+                "enabled": settings.intent_enabled,
+                "commands": list(SUPPORTED_INTENTS),
+                "min_confidence": settings.intent_min_confidence,
+                "wake_words": [
+                    w.strip()
+                    for w in (settings.wake_words or "").split(",")
+                    if w.strip()
+                ],
+                "wake_word_required": settings.wake_word_required,
+                "wake_word_window_sec": settings.wake_word_window_sec,
+                "echo_mode": settings.echo_mode,
+                "echo_cooldown_ms": settings.echo_cooldown_ms,
+                "echo_similarity_threshold": settings.echo_similarity_threshold,
+                "max_frame_size": settings.max_frame_size,
+                "push_to_talk": settings.push_to_talk,
+                "push_to_talk_timeout_ms": settings.push_to_talk_timeout_ms,
             },
         }
     )

@@ -55,12 +55,20 @@ import argparse
 import asyncio
 import contextlib
 import json
+import queue
 import sys
+import threading
 
 import numpy as np
 import sounddevice as sd
 import websockets
 from silero_vad import VADIterator, load_silero_vad
+
+try:
+    from pynput import keyboard as pynput_keyboard
+    PYNPUT_AVAILABLE = True
+except ImportError:
+    PYNPUT_AVAILABLE = False
 
 URI = "ws://localhost:8000/ws/transcribe"
 
@@ -73,6 +81,65 @@ PING_INTERVAL = 15.0
 DEFAULT_VAD_THRESHOLD = 0.5
 DEFAULT_VAD_FRAMES = 2
 PLAYBACK_STOP_TIMEOUT = 2.0
+
+
+def _setup_global_hotkey(ptt_state_queue: queue.Queue[bool]) -> None:
+    """Try to set up global Shift+Z hotkey using pynput."""
+    if not PYNPUT_AVAILABLE:
+        return
+
+    _shift_pressed = False
+    _z_pressed = False
+
+    def _on_press(key):
+        nonlocal _shift_pressed, _z_pressed
+        try:
+            if key == pynput_keyboard.Key.shift_l or key == pynput_keyboard.Key.shift_r:
+                _shift_pressed = True
+            elif hasattr(key, "char") and key.char == "z":
+                _z_pressed = True
+        except AttributeError:
+            pass
+        if _shift_pressed and _z_pressed:
+            ptt_state_queue.put_nowait(True)
+
+    def _on_release(key):
+        nonlocal _shift_pressed, _z_pressed
+        try:
+            if key == pynput_keyboard.Key.shift_l or key == pynput_keyboard.Key.shift_r:
+                _shift_pressed = False
+            elif hasattr(key, "char") and key.char == "z":
+                _z_pressed = False
+        except AttributeError:
+            pass
+
+    listener = pynput_keyboard.Listener(on_press=_on_press, on_release=_on_release)
+    listener.daemon = True
+    listener.start()
+    print("[ptt] Shift+Z hotkey listener started (pynput, requires admin for global)", flush=True)
+
+
+def _setup_console_hotkey(ptt_state_queue: queue.Queue[bool]) -> None:
+    """Fallback: press Enter in terminal to enable PTT."""
+    import sys
+    if not sys.stdin.isatty():
+        print("[ptt] Console mode not available (non-interactive terminal)", flush=True)
+        return
+
+    def _console_listener():
+        print("Idle (press Enter to enable mic)", flush=True)
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                # EOF - exit the listener
+                break
+            if line == "\n":
+                # Actual Enter press - enable PTT
+                ptt_state_queue.put_nowait(True)
+
+    thread = threading.Thread(target=_console_listener, daemon=True)
+    thread.start()
+    print("Console fallback active: press Enter to enable mic", flush=True)
 
 
 def _build_uri(uri: str, token: str | None) -> str:
@@ -97,15 +164,24 @@ async def stream_mic(
     voice: str | None,
     vad_threshold: float,
     vad_frames: int,
+    ptt_mode: str = "console",
 ) -> None:
     mic_queue: asyncio.Queue[bytes] = asyncio.Queue()
     audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
     playback_task: asyncio.Task | None = None
     speech_onset_count = 0
     tts_playing = False
+    ptt_enabled = False
+    ptt_state_queue: queue.Queue[bool] = queue.Queue()
 
     model = load_silero_vad(onnx=True)
     vad = VADIterator(model, threshold=vad_threshold, sampling_rate=SAMPLE_RATE)
+
+    # Set up PTT hotkey with fallback
+    if ptt_mode == "global" and PYNPUT_AVAILABLE:
+        _setup_global_hotkey(ptt_state_queue)
+    else:
+        _setup_console_hotkey(ptt_state_queue)
 
     def audio_callback(indata, frames, time_info, status):
         if status:
@@ -129,10 +205,25 @@ async def stream_mic(
         tts_playing = False
 
     async def send_audio(websocket):
-        nonlocal speech_onset_count, tts_playing
+        nonlocal speech_onset_count, tts_playing, ptt_enabled
         sample_buf = bytearray()
         while True:
             chunk = await mic_queue.get()
+
+            while True:
+                try:
+                    new_state = ptt_state_queue.get_nowait()
+                except queue.Empty:
+                    break
+                ptt_enabled = new_state
+                await websocket.send(
+                    json.dumps({"type": "talk", "active": ptt_enabled})
+                )
+                if ptt_enabled:
+                    await flush_playback()
+                    speech_onset_count = 0
+                print(f"[ptt] State changed: {'ON' if ptt_enabled else 'OFF'}", flush=True)
+
             sample_buf.extend(chunk)
             while len(sample_buf) >= FRAME_BYTES:
                 frame = bytes(sample_buf[:FRAME_BYTES])
@@ -165,10 +256,11 @@ async def stream_mic(
                 elif result and "end" in result:
                     speech_onset_count = 0
 
-                # While TTS is playing, do NOT send mic audio to the server.
-                # This prevents the assistant from hearing its own TTS output
-                # and responding to itself.
-                if not tts_playing:
+                # Mic audio is sent only when PTT is on and the assistant
+                # is not currently speaking. When PTT is off the server
+                # discards the audio; when TTS is playing we mute locally
+                # so the assistant does not hear its own voice.
+                if ptt_enabled and not tts_playing:
                     await websocket.send(frame)
 
     async def play_tts_audio():
@@ -191,27 +283,34 @@ async def stream_mic(
             stream.close()
 
     async def receive_loop(websocket):
-        nonlocal playback_task, tts_playing, speech_onset_count
+        nonlocal playback_task, tts_playing, speech_onset_count, ptt_enabled
         while True:
             msg = await websocket.recv()
             if isinstance(msg, bytes):
-                # First TTS audio frame: mark TTS as playing to mute mic
+                if ptt_enabled:
+                    continue
                 if playback_task is None or playback_task.done():
                     playback_task = asyncio.create_task(play_tts_audio())
                     tts_playing = True
+                    ptt_enabled = False
                     speech_onset_count = 0
                 await audio_queue.put(msg)
             else:
                 obj = json.loads(msg)
                 msg_type = obj.get("type", "")
-                if msg_type == "tts_end":
+                if msg_type == "ptt_state":
+                    ptt_enabled = obj.get("active", False)
+                    if ptt_enabled:
+                        print("Listening...", flush=True)
+                    else:
+                        print("Idle", flush=True)
+                elif msg_type == "tts_end":
                     if playback_task is not None and playback_task.done():
                         playback_task = None
                     tts_playing = False
                 elif msg_type == "tts_error":
                     tts_playing = False
                 elif msg_type == "llm_response":
-                    # New LLM turn incoming — make sure mic is unmuted
                     pass
                 print(f"[event] {obj}", flush=True)
 
@@ -278,6 +377,12 @@ if __name__ == "__main__":
         default=DEFAULT_VAD_FRAMES,
         help="Consecutive speech frames to trigger flush (default: %(default)s)",
     )
+    parser.add_argument(
+        "--ptt-mode",
+        choices=["global", "console"],
+        default="console",
+        help="PTT hotkey mode: 'global' (Shift+Z, requires admin), 'console' (Enter key, no admin)",
+    )
     args = parser.parse_args()
 
     try:
@@ -289,6 +394,7 @@ if __name__ == "__main__":
                 args.voice,
                 args.vad_threshold,
                 args.vad_frames,
+                args.ptt_mode,
             )
         )
     except KeyboardInterrupt:

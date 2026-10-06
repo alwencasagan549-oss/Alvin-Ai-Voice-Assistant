@@ -1,0 +1,12 @@
+# Test + lint tooling. Not needed to run the service.
+#   pip install -r requirements-dev.txt   # installs runtime deps too
+#
+# Kept separate from requirements.txt so a production install does not pull in
+# pytest/ruff. pytest-asyncio is required: without it every async test is
+# skipped with "async def functions are not natively supported".
+-r requirements.txt
+
+pytest~=9.1
+pytest-asyncio~=1.3
+ruff~=0.16
+pynput~=1.8

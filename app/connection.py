@@ -36,10 +36,29 @@ from fastapi import WebSocket, WebSocketException, status
 from starlette.websockets import WebSocketDisconnect
 
 from .config import settings
-from .llm import MessageParam, build_messages, llm_service
+from .echo import EchoGuard
+from .intents import (
+    ALWAYS_CONFIRM_INTENTS,
+    ASSISTANT_SIDE_EFFECT_INTENTS,
+    MIC_CONTROL_INTENTS,
+    IntentMatch,
+    route_command,
+)
+from .llm import ConversationHistory, MessageParam, build_messages, llm_service
 from .stt import STTService
 from .tts import synthesize_stream
 from .vad import FRAME_SAMPLES, VADStreamDetector
+
+# Initial capacity of the per-connection audio accumulator, in samples
+# (~2 s at 16 kHz). It doubles on demand up to one utterance's worth, so a
+# short utterance never allocates a 20 s buffer while a long one stops
+# reallocating after the first couple of seconds.
+_INITIAL_BUFFER_SAMPLES = 32_000
+
+# How long to let the transcription consumer drain on shutdown before we stop
+# waiting for it. A local Whisper decode of a long segment can take a couple of
+# seconds; past this the socket is closed anyway.
+_CONSUMER_SHUTDOWN_TIMEOUT_SEC = 5.0
 
 log = logging.getLogger("alvin.connection")
 
@@ -49,6 +68,8 @@ _CONTROL_STOP = "stop"
 _CONTROL_PING = "ping"
 _CONTROL_SPEAK = "speak"
 _CONTROL_STOP_SPEAK = "stop_speak"
+_CONTROL_TALK = "talk"
+_CONTROL_CONTROL = "control"
 
 _NONE_LANGS = {"auto", "none", "null", ""}
 
@@ -156,10 +177,12 @@ class Connection:
 
         # Audio accumulator + VAD read pointer. The buffer is reset whenever a
         # finalized segment completes so memory stays bounded to ~one utterance.
-        self._audio_chunks: list[np.ndarray] = []
+        # ``_buffer`` is a fixed-capacity growable buffer with an explicit fill length:
+        # appending is O(new samples) and slicing for the VAD/segments never copies
+        # the whole utterance.
+        self._buffer = np.empty(_INITIAL_BUFFER_SAMPLES, dtype=np.float32)
         self._audio_length = 0
         self.vad_pointer = 0
-        self._audio_cache: np.ndarray | None = None
 
         # Pending (in-progress) utterance bookkeeping.
         self.seg_start: int | None = None
@@ -172,8 +195,12 @@ class Connection:
         )
         self.min_segment_samples = settings.min_segment_samples
         self.max_segment_samples = settings.max_segment_samples
+        # Hard cap on how much audio we will ever hold for one utterance. Sized
+        # from MAX_SEGMENT_SECONDS plus one VAD frame of slack so the growable
+        # buffer stops reallocating in the steady state.
+        self._max_buffer_samples = self.max_segment_samples + FRAME_SAMPLES * 2
 
-        self.queue: asyncio.Queue[_PendingSegment | None] = asyncio.Queue()
+        self.queue: asyncio.Queue[_PendingSegment | None] = asyncio.Queue(maxsize=settings.transcription_queue_maxsize)
         self.consumer: asyncio.Task | None = None
         self.stopping = False
         self._utterance_id: int = 0
@@ -185,25 +212,31 @@ class Connection:
         self.tts_voice = settings.tts_voice
         self.send_lock = asyncio.Lock()
 
+        # Mic-control audio gating: when the user mutes the microphone,
+        # incoming segments run a local-only keyword pass (never the cloud)
+        # instead of the full STT -> intent/LLM pipeline.
+        self.is_muted = False
+
+        # Echo guard: tracks playback state and history for self-echo filtering.
+        self.echo = EchoGuard()
+
+        # Push-to-talk: when active, audio is processed; when inactive, audio
+        # is discarded unless the user is holding the hotkey.
+        self.ptt_active = False
+        self._ptt_timeout_handle: asyncio.Task | None = None
+
         # Conversation memory: system prompt is pinned at index 0, followed by
-        # alternating user/assistant turns.  Trimmed to MAX_LLM_HISTORY messages
-        # before each LLM call to bound latency and context length.
-        self.history: list[MessageParam] = [
-            {"role": "system", "content": settings.llm_system_prompt}
-        ]
+        # alternating user/assistant turns. ConversationHistory enforces the
+        # MAX_LLM_HISTORY cap on every append, so no code path can grow the
+        # context without bound.
+        self.history: ConversationHistory = ConversationHistory(
+            [{"role": "system", "content": settings.llm_system_prompt}],
+            max_history=settings.max_llm_history,
+        )
 
     def _get_audio(self) -> np.ndarray:
-        """Get the full audio buffer, concatenating chunks lazily."""
-        if (
-            self._audio_cache is not None
-            and self._audio_cache.size == self._audio_length
-        ):
-            return self._audio_cache
-        if not self._audio_chunks:
-            self._audio_cache = np.empty(0, dtype=np.float32)
-        else:
-            self._audio_cache = np.concatenate(self._audio_chunks)
-        return self._audio_cache
+        """The filled prefix of the audio accumulator (no copy)."""
+        return self._buffer[: self._audio_length]
 
     async def run(self) -> None:
         """Main entry: start the consumer, drain the socket, then flush."""
@@ -216,12 +249,26 @@ class Connection:
             log.exception("receive loop error")
             await self._send_error(exc)
         finally:
+            self._cancel_ptt_timeout()
             await self._flush_pending()
-            await self.queue.put(None)
+            # Never block on a full queue during shutdown: the consumer is
+            # bounded by a drain timeout, so dropping the sentinel here is safe.
+            try:
+                self.queue.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
             await self._cancel_ongoing_turn()
             if self.consumer is not None:
                 try:
-                    await self.consumer
+                    await asyncio.wait_for(self.consumer, timeout=_CONSUMER_SHUTDOWN_TIMEOUT_SEC)
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "consumer did not drain within %.1fs; cancelling",
+                        _CONSUMER_SHUTDOWN_TIMEOUT_SEC,
+                    )
+                    self.consumer.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await self.consumer
                 except Exception:
                     log.exception("consumer task error")
 
@@ -246,6 +293,8 @@ class Connection:
     async def _on_audio(self, data: bytes) -> None:
         if not data:
             return
+        if settings.push_to_talk and not self.ptt_active:
+            return
         if len(data) > settings.max_frame_size:
             log.warning(
                 "rejecting oversized audio frame: %d bytes > %d bytes",
@@ -259,8 +308,7 @@ class Connection:
         samples = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
         if samples.size == 0:
             return
-        self._audio_chunks.append(samples)
-        self._audio_length += samples.size
+        self._append_audio(samples)
         await self._feed_vad()
 
     async def _on_text(self, text: str) -> None:
@@ -288,7 +336,58 @@ class Connection:
                 await self._start_tts(speak_text, data.get("voice"))
         elif ctype == _CONTROL_STOP_SPEAK:
             await self._cancel_ongoing_turn()
+        elif ctype == _CONTROL_TALK:
+            active = data.get("active")
+            if active is not None:
+                await self._set_ptt_active(bool(active))
+        elif ctype == _CONTROL_CONTROL:
+            # Client-side keyword spotter (or equivalent) heard a command
+            # while the mic was muted; the client stays the one deciding what
+            # to listen for, the server just applies the state change.
+            action = data.get("action")
+            if action == "unmute_request" and self.is_muted:
+                log.info("unmute requested via control frame; re-enabling STT")
+                match = route_command("unmute", allowed=MIC_CONTROL_INTENTS)
+                if match is not None:
+                    await self._dispatch_command(match)
         # Unknown control messages are ignored for forward compatibility.
+
+    async def _set_ptt_active(self, active: bool) -> None:
+        if self.ptt_active == active:
+            return
+        self.ptt_active = active
+        if active:
+            self._reset_ptt_timeout()
+            if self.llm_task is not None or self.tts_task is not None:
+                asyncio.create_task(self._cancel_ongoing_turn())
+        else:
+            self._cancel_ptt_timeout()
+        # Notify client of PTT state change
+        await self._send_raw({"type": "ptt_state", "active": active})
+
+    def _reset_ptt_timeout(self) -> None:
+        self._cancel_ptt_timeout()
+        if settings.push_to_talk_timeout_ms > 0:
+            self._ptt_timeout_handle = asyncio.create_task(
+                asyncio.sleep(settings.push_to_talk_timeout_ms / 1000.0)
+            )
+
+            def _timeout_cb(t):
+                if not t.cancelled():
+                    asyncio.create_task(self._on_ptt_timeout())
+
+            self._ptt_timeout_handle.add_done_callback(_timeout_cb)
+
+    def _cancel_ptt_timeout(self) -> None:
+        if self._ptt_timeout_handle is not None:
+            self._ptt_timeout_handle.cancel()
+            self._ptt_timeout_handle = None
+
+    async def _on_ptt_timeout(self) -> None:
+        self.ptt_active = False
+        self._ptt_timeout_handle = None
+        log.info("PTT timeout expired; auto-disabling push-to-talk")
+        await self._send_raw({"type": "ptt_state", "active": False})
 
     # ------------------------------------------------------------------ #
     # VAD + endpointing
@@ -315,6 +414,9 @@ class Connection:
                 await self._cancel_ongoing_turn()
             elif "end" in event:
                 await self._finalize(int(event["end"]))
+                # Auto-disable PTT when speech ends (single-press mode)
+                if settings.push_to_talk and self.ptt_active:
+                    await self._set_ptt_active(False)
                 # _finalize may reset the audio buffer (via _reset_segment),
                 # so re-fetch to avoid reprocessing stale cached audio.
                 audio = self._get_audio()
@@ -376,12 +478,36 @@ class Connection:
         self._utterance_id += 1
         self._reset_segment()
 
+
+    def _append_audio(self, samples: np.ndarray) -> None:
+        """Append samples to the accumulator, growing it geometrically if needed.
+
+        The buffer is capped at ``_max_buffer_samples`` (one utterance's worth).
+        A single oversized frame that would exceed the cap is clipped to it --
+        ``_feed_vad`` will finalize the segment at that point and call
+        ``_reset_segment``, which starts fresh.
+        """
+        needed = self._audio_length + samples.size
+        if needed > self._buffer.size:
+            # Grow geometrically, but never past what one utterance can hold:
+            # past that point MAX_SEGMENT_SECONDS ends the utterance anyway.
+            capacity = min(max(needed, self._buffer.size * 2), self._max_buffer_samples)
+            grown = np.empty(capacity, dtype=np.float32)
+            grown[: self._audio_length] = self._buffer[: self._audio_length]
+            self._buffer = grown
+        # Clip the write to the hard cap so an oversized frame cannot grow the
+        # buffer beyond ``_max_buffer_samples`` (a previous ``max(capacity, needed)``
+        # line defeated the cap here, allowing unbounded growth from a large frame).
+        write_end = min(needed, self._buffer.size)
+        copy_len = write_end - self._audio_length
+        if copy_len > 0:
+            self._buffer[self._audio_length : write_end] = samples[:copy_len]
+        self._audio_length = write_end
+
     def _reset_segment(self) -> None:
         """Begin a fresh VAD lifetime (new utterance)."""
         self.detector.reset()
-        self._audio_chunks.clear()
         self._audio_length = 0
-        self._audio_cache = None
         self.vad_pointer = 0
         self.seg_start = None
         self.last_partial_at = 0
@@ -416,21 +542,36 @@ class Connection:
     # ------------------------------------------------------------------ #
     # LLM + final utterance handling
     # ------------------------------------------------------------------ #
-    async def _handle_final_utterance(self, text: str) -> None:
-        """After a final transcript: run it through the LLM brain.
+    async def _handle_final_utterance(self, text: str, confidence: float = 1.0) -> None:
+        """After a final transcript: try deterministic intents first, then LLM.
 
-        Pipeline: transcript -> LLM (streamed sentences) -> TTS per sentence.
-        Uses streaming so the first sentence reaches the speaker before the
-        LLM finishes writing the full reply (lower Time-To-First-Audio).
-
-        When the LLM is disabled (no API key), falls back to the previous
-        behaviour of speaking the raw transcript when ``TTS_AUTO_SPEAK`` is on.
+        Fixed device actions ("stop", "mute", "volume up", "turn off the
+        lights", ...) are matched on the ITN-normalized transcript by
+        :func:`app.intents.route_command` and never pay an LLM round-trip;
+        ambiguous or open-ended utterances fall through to the LLM brain.
         """
         if not text.strip():
             return
 
         # Don't process LLM if the connection is already closing/stopping.
         if self.stopping:
+            return
+
+        # Self-echo: if this final transcript is what we just said, it is our
+        # own voice leaking back in, not a user request. Dropping it before
+        # the intent router keeps the assistant from obeying itself.
+        if self.echo.is_echo(text):
+            # The real final event was already emitted by the consumer; this
+            # utterance is our own playback leaking back, so drop it here
+            # without a second event (a duplicate is_final would make clients
+            # treat one utterance as two turns).
+            log.info("echo guard: dropped self-referential transcript %r", text[:60])
+            return
+
+        # Try deterministic intent routing first.
+        match = route_command(text, confidence)
+        if match is not None:
+            await self._dispatch_command(match)
             return
 
         # Build the message list: system prompt + trimmed history + new user turn.
@@ -445,6 +586,90 @@ class Connection:
         else:
             if settings.tts_auto_speak:
                 await self._start_tts(text)
+
+    async def _dispatch_command(self, match: IntentMatch) -> None:
+        """Execute a deterministic device command without an LLM round-trip.
+
+        Assistant-side effects (stop/pause) cancel any in-progress LLM stream
+        and TTS first so the assistant does not keep talking. Every command is
+        relayed to the client as a ``command`` event carrying the intent and
+        extracted slots; the owning device acts on it. Commands never enter
+        the LLM conversation history.
+
+        Mic-control commands additionally flip ``self.is_muted`` (audio
+        gating), and their hardcoded confirmation is always spoken -- it is
+        the user's only feedback, and after a mute it explains how to get
+        the assistant back.
+        """
+        if match.intent in ASSISTANT_SIDE_EFFECT_INTENTS:
+            await self._cancel_ongoing_turn()
+
+        # A bare wake word is not a device command: it is a local "I'm here".
+        # Acknowledge it in-band (no ``command`` event, no client action), arm
+        # the wake window if one is configured, and keep it out of history so
+        # the next utterance is the start of a fresh conversation turn.
+        if match.intent == "wake":
+            if settings.wake_word_window_sec > 0:
+                self._wake_armed_until = (
+                    time.monotonic() + settings.wake_word_window_sec
+                )
+            log.debug("wake word %r acknowledged", match.wake_word)
+            if settings.wake_speak_ack and match.confirmation:
+                await self._start_tts(match.confirmation)
+            return
+
+        if match.intent == "mute_mic":
+            self.is_muted = True
+        elif match.intent == "unmute_mic":
+            self.is_muted = False
+
+        speak = match.confirmation and (
+            settings.intent_speak_confirmation or match.intent in ALWAYS_CONFIRM_INTENTS
+        )
+
+        event: dict = {
+            "type": "command",
+            "intent": match.intent,
+            "slots": match.slots,
+            "raw": match.raw,
+            "normalized": match.normalized,
+        }
+        if match.action:
+            event["action"] = match.action
+        if match.wake_word:
+            # Lets a client render a "heard" indicator without re-running STT.
+            event["wake_word"] = match.wake_word
+        if speak:
+            event["speak"] = match.confirmation
+        await self._send_raw(event)
+
+        if speak:
+            await self._start_tts(match.confirmation)
+
+    async def _handle_muted_segment(self, item: _PendingSegment) -> None:
+        """Muted-mode transcription: local keyword pass only, never the cloud.
+
+        While the mic is muted, final segments are decoded on the local INT8
+        model and matched against the mic-control intents only, so "unmute"
+        (or "alvin unmute") still works without paying for a full STT/LLM
+        turn. Partial hypotheses are ignored, and anything that is not a
+        mic-control command is dropped silently.
+        """
+        if not item.is_final:
+            return
+        try:
+            text, confidence = await self.stt.transcribe_local_async(
+                item.audio, self.language
+            )
+        except Exception as exc:  # noqa: BLE001 - gating must not kill the loop
+            log.warning("muted keyword pass failed (%s: %s)", type(exc).__name__, exc)
+            return
+        if not text.strip():
+            return
+        log.debug("muted keyword pass: %r (conf=%.2f)", text[:60], confidence)
+        match = route_command(text, confidence, allowed=MIC_CONTROL_INTENTS)
+        if match is not None:
+            await self._dispatch_command(match)
 
     def _spawn_llm_turn(self, messages: list[MessageParam], fallback_text: str) -> None:
         """Spawn a background task that streams the LLM reply to TTS.
@@ -566,6 +791,8 @@ class Connection:
     # ------------------------------------------------------------------ #
     async def _start_tts(self, text: str, voice: str | None = None) -> None:
         """(Re)start speech synthesis, cancelling anything already playing."""
+        if settings.push_to_talk:
+            await self._set_ptt_active(False)
         await self._cancel_ongoing_turn()
         self.tts_task = asyncio.create_task(self._speak(text, voice or self.tts_voice))
 
@@ -616,6 +843,7 @@ class Connection:
         self, transcript: str, is_partial: bool, is_final: bool, confidence: float
     ) -> None:
         event: dict = {
+            "type": "transcript",
             "transcript": transcript,
             "is_partial": is_partial,
             "is_final": is_final,
