@@ -139,7 +139,7 @@ def test_open_ended_utterance_reaches_the_llm(monkeypatch: pytest.MonkeyPatch) -
     seen: list[object] = []
 
     async def fake_stream(
-        messages, *, max_tokens=None, temperature=None, fallback_text=None
+        messages, *, max_tokens=None, temperature=None, fallback_text=None, tools=None, tool_choice=None
     ):
         seen.append(messages)
         yield ("Sure. I will check the weather for you.", "fake-model")
@@ -174,7 +174,7 @@ def test_low_confidence_transcript_falls_back_to_the_llm(
     seen: list[object] = []
 
     async def fake_stream(
-        messages, *, max_tokens=None, temperature=None, fallback_text=None
+        messages, *, max_tokens=None, temperature=None, fallback_text=None, tools=None, tool_choice=None
     ):
         seen.append(messages)
         yield ("Sure.", "fake-model")

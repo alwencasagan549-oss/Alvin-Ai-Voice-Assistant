@@ -83,7 +83,7 @@ DEFAULT_VAD_FRAMES = 2
 PLAYBACK_STOP_TIMEOUT = 2.0
 
 
-def _setup_global_hotkey(ptt_state_queue: queue.Queue[bool]) -> None:
+def _setup_global_hotkey(ptt_state_queue: queue.Queue[bool], on_hotkey=None) -> None:
     """Try to set up global Shift+Z hotkey using pynput."""
     if not PYNPUT_AVAILABLE:
         return
@@ -101,6 +101,8 @@ def _setup_global_hotkey(ptt_state_queue: queue.Queue[bool]) -> None:
         except AttributeError:
             pass
         if _shift_pressed and _z_pressed:
+            if on_hotkey:
+                on_hotkey()
             ptt_state_queue.put_nowait(True)
 
     def _on_release(key):
@@ -119,27 +121,26 @@ def _setup_global_hotkey(ptt_state_queue: queue.Queue[bool]) -> None:
     print("[ptt] Shift+Z hotkey listener started (pynput, requires admin for global)", flush=True)
 
 
-def _setup_console_hotkey(ptt_state_queue: queue.Queue[bool]) -> None:
-    """Fallback: press Enter in terminal to enable PTT."""
+def _setup_console_hotkey(ptt_state_queue: queue.Queue[bool], flush_callback) -> None:
+    """Fallback: press Enter in terminal to enable/disable PTT or stop TTS."""
     import sys
     if not sys.stdin.isatty():
         print("[ptt] Console mode not available (non-interactive terminal)", flush=True)
         return
 
     def _console_listener():
-        print("Idle (press Enter to enable mic)", flush=True)
+        print("Idle (press Enter to enable mic, Enter again to stop)", flush=True)
         while True:
             line = sys.stdin.readline()
             if not line:
-                # EOF - exit the listener
                 break
             if line == "\n":
-                # Actual Enter press - enable PTT
+                flush_callback()
                 ptt_state_queue.put_nowait(True)
 
     thread = threading.Thread(target=_console_listener, daemon=True)
     thread.start()
-    print("Console fallback active: press Enter to enable mic", flush=True)
+    print("Console fallback active: press Enter to enable mic / stop TTS", flush=True)
 
 
 def _build_uri(uri: str, token: str | None) -> str:
@@ -177,17 +178,6 @@ async def stream_mic(
     model = load_silero_vad(onnx=True)
     vad = VADIterator(model, threshold=vad_threshold, sampling_rate=SAMPLE_RATE)
 
-    # Set up PTT hotkey with fallback
-    if ptt_mode == "global" and PYNPUT_AVAILABLE:
-        _setup_global_hotkey(ptt_state_queue)
-    else:
-        _setup_console_hotkey(ptt_state_queue)
-
-    def audio_callback(indata, frames, time_info, status):
-        if status:
-            print(f"[audio-callback] {status}", file=sys.stderr, flush=True)
-        mic_queue.put_nowait(indata.tobytes())
-
     async def flush_playback():
         """Drain the TTS playback queue and stop the playback task."""
         nonlocal playback_task, tts_playing
@@ -203,6 +193,27 @@ async def stream_mic(
             await asyncio.wait_for(playback_task, timeout=PLAYBACK_STOP_TIMEOUT)
         playback_task = None
         tts_playing = False
+
+    loop = asyncio.get_running_loop()
+
+    def _flush_and_enable_ptt():
+        try:
+            fut = asyncio.run_coroutine_threadsafe(flush_playback(), loop)
+            fut.result(timeout=2)
+        except Exception as exc:
+            print(f"[ptt] flush failed: {exc}", file=sys.stderr, flush=True)
+        ptt_state_queue.put_nowait(True)
+
+    # Set up PTT hotkey with fallback
+    if ptt_mode == "global" and PYNPUT_AVAILABLE:
+        _setup_global_hotkey(ptt_state_queue, _flush_and_enable_ptt)
+    else:
+        _setup_console_hotkey(ptt_state_queue, _flush_and_enable_ptt)
+
+    def audio_callback(indata, frames, time_info, status):
+        if status:
+            print(f"[audio-callback] {status}", file=sys.stderr, flush=True)
+        mic_queue.put_nowait(indata.tobytes())
 
     async def send_audio(websocket):
         nonlocal speech_onset_count, tts_playing, ptt_enabled
@@ -298,7 +309,18 @@ async def stream_mic(
             else:
                 obj = json.loads(msg)
                 msg_type = obj.get("type", "")
-                if msg_type == "ptt_state":
+                if msg_type == "transcript":
+                    if obj.get("is_final"):
+                        if ptt_enabled:
+                            ptt_enabled = False
+                            await websocket.send(
+                                json.dumps({"type": "talk", "active": False})
+                            )
+                            print(
+                                "[ptt] State changed: OFF (transcript finalized)",
+                                flush=True,
+                            )
+                elif msg_type == "ptt_state":
                     ptt_enabled = obj.get("active", False)
                     if ptt_enabled:
                         print("Listening...", flush=True)

@@ -44,7 +44,7 @@ from .intents import (
     IntentMatch,
     route_command,
 )
-from .llm import ConversationHistory, MessageParam, build_messages, llm_service
+from .llm import ConversationHistory, MessageParam, WEB_SEARCH_TOOL_SCHEMA, build_messages, llm_service
 from .stt import STTService
 from .tts import synthesize_stream
 from .vad import FRAME_SAMPLES, VADStreamDetector
@@ -708,19 +708,38 @@ class Connection:
         Each completed sentence is sent to the client as an ``llm_response``
         event and simultaneously fed to ``synthesize_stream`` for speech output.
         If the LLM fails entirely, the fallback text (raw transcript) is spoken.
+        When a tool call is detected, a short filler line is spoken before the
+        search runs.
         """
         started = time.perf_counter()
         total_bytes = 0
         errors: list[dict] = []
         full_response_parts: list[str] = []
 
+        tools = None
+        if llm_service.enabled:
+            tools = [WEB_SEARCH_TOOL_SCHEMA]
+
         try:
             async with contextlib.aclosing(
                 llm_service.stream_response(
-                    messages, fallback_text=fallback_text
+                    messages, fallback_text=fallback_text, tools=tools, tool_choice="auto"
                 )
             ) as agen:
                 async for sentence, model in agen:
+                    if sentence is None and isinstance(model, str) and model.startswith("tool_call:"):
+                        tool_name = model.split(":", 1)[1]
+                        filler = "Let me check that." if tool_name == "web_search" else "Let me check."
+                        async for item in synthesize_stream(filler, self.tts_voice):
+                            if isinstance(item, dict):
+                                event = {**item, "type": "tts_error"}
+                                errors.append(event)
+                                await self._send_raw(event)
+                                continue
+                            total_bytes += len(item)
+                            await self._send_bytes(item)
+                        continue
+
                     full_response_parts.append(sentence)
                     await self._send_raw(
                         {

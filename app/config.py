@@ -121,6 +121,8 @@ ENV_VAR_NAMES = [
     "ECHO_SIMILARITY_THRESHOLD",
     "ECHO_HISTORY_SEC",
     "ECHO_COOLDOWN_MS",
+    "TAVILY_API_KEY",
+    "DEBUG",
 ]
 
 _NONE = {"", "auto", "none", "null"}
@@ -295,10 +297,10 @@ class Settings:
     # Other tested models (nemotron-3.5-lightning-30b-a3b, etc.) return
     # thinking-process text or fail with NotFoundError for this API key.
     llm_api_key: str = _env("LLM_API_KEY", _env("NVIDIA_API_KEY", "")).strip()
-    llm_base_url: str = _env("LLM_BASE_URL", "https://integrate.api.nvidia.com/v1")
-    llm_model: str = _env("LLM_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+    llm_base_url: str = _env("LLM_BASE_URL", "https://api.kilo.ai/api/gateway")
+    llm_model: str = _env("LLM_MODEL", "nvidia/nemotron-3.5-lightning:free")
     llm_enabled: bool = _env_bool("LLM_ENABLED", True)
-    llm_max_tokens: int = _env_int("LLM_MAX_TOKENS", 128)
+    llm_max_tokens: int = _env_int("LLM_MAX_TOKENS", 300)
     llm_temperature: float = _env_float("LLM_TEMPERATURE", 0.7)
     llm_system_prompt: str = _env(
         "LLM_SYSTEM_PROMPT",
@@ -311,7 +313,7 @@ class Settings:
     llm_warmup: bool = _env_bool("LLM_WARMUP", True)
     # Use Cloudflare Workers AI as primary instead of Kilo AI / NVIDIA NIM.
     # When true, skips the primary NVIDIA NIM call and goes straight to Cloudflare.
-    llm_use_cf_as_primary: bool = _env_bool("LLM_USE_CF_AS_PRIMARY", False)
+    llm_use_cf_as_primary: bool = _env_bool("LLM_USE_CF_AS_PRIMARY", True)
 
     # --- cloudflare fallback (secondary LLM provider) ---------------------- #
     # Cloudflare Workers AI fallback when NVIDIA NIM fails or times out.
@@ -333,6 +335,11 @@ class Settings:
     max_llm_history: int = _env_int("MAX_LLM_HISTORY", 12)
     # Tokens reserved for the system prompt + history when trimming.
     llm_max_history_tokens: int = _env_int("LLM_MAX_HISTORY_TOKENS", 2000)
+
+    # --- web search -------------------------------------------------------- #
+    tavily_api_key: str = _env("TAVILY_API_KEY", "").strip()
+    # Debug flag for logging search decisions
+    debug: bool = _env_bool("DEBUG", False)
 
     @property
     def language(self) -> str | None:
