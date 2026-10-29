@@ -29,6 +29,7 @@ import json
 import logging
 import secrets
 import time
+from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -44,8 +45,17 @@ from .intents import (
     IntentMatch,
     route_command,
 )
-from .llm import ConversationHistory, MessageParam, WEB_SEARCH_TOOL_SCHEMA, build_messages, llm_service
-from .stt import STTService
+from .llm import (
+    ConversationHistory,
+    MessageParam,
+    WEB_SEARCH_TOOL_SCHEMA,
+    build_messages,
+    build_system_prompt,
+    llm_service,
+)
+from .youtube import fallback_search_url, search_youtube
+from .speaker import get_speaker_service
+from .stt import STTService, audio_dbfs
 from .tts import synthesize_stream
 from .vad import FRAME_SAMPLES, VADStreamDetector
 
@@ -59,6 +69,13 @@ _INITIAL_BUFFER_SAMPLES = 32_000
 # waiting for it. A local Whisper decode of a long segment can take a couple of
 # seconds; past this the socket is closed anyway.
 _CONSUMER_SHUTDOWN_TIMEOUT_SEC = 5.0
+_PARTIAL_QUEUE_TIMEOUT_SEC = 0.5
+_FINAL_QUEUE_TIMEOUT_SEC = 2.0
+
+# Consecutive turns that must go unidentified before the speaker context is
+# dropped. One unknown turn is usually a cough or a mis-heard syllable, so the
+# personalization is kept until the evidence repeats.
+_UNKNOWN_SPEAKER_RESET_STREAK = 2
 
 log = logging.getLogger("alvin.connection")
 
@@ -70,6 +87,7 @@ _CONTROL_SPEAK = "speak"
 _CONTROL_STOP_SPEAK = "stop_speak"
 _CONTROL_TALK = "talk"
 _CONTROL_CONTROL = "control"
+_CONTROL_RESET = "reset"
 
 _NONE_LANGS = {"auto", "none", "null", ""}
 
@@ -81,7 +99,8 @@ class ConnectionManager:
     ``await`` in between), so two handshakes racing on the event loop cannot
     both pass the check and over-admit. Admission happens before ``accept()``:
     a rejected client gets a denied handshake instead of an accepted socket
-    that is immediately closed.
+    that is immediately closed. Starlette rejects a pre-accept close as an
+    HTTP 403 response; browser WebSocket APIs do not receive its internal code.
     """
 
     def __init__(self) -> None:
@@ -92,7 +111,7 @@ class ConnectionManager:
         return len(self._active)
 
     async def connect(self, websocket: WebSocket, max_connections: int) -> None:
-        """Reserve a slot and accept, or deny the handshake with 1008."""
+        """Reserve a slot and accept, or reject the handshake before acceptance."""
         if len(self._active) >= max_connections:
             log.warning(
                 "rejecting websocket: %d/%d connections in use",
@@ -210,6 +229,7 @@ class Connection:
         self.tts_task: asyncio.Task | None = None
         self.llm_task: asyncio.Task | None = None
         self.tts_voice = settings.tts_voice
+        self.tts_enabled = True  # Per-connection TTS enable/disable
         self.send_lock = asyncio.Lock()
 
         # Mic-control audio gating: when the user mutes the microphone,
@@ -223,7 +243,11 @@ class Connection:
         # Push-to-talk: when active, audio is processed; when inactive, audio
         # is discarded unless the user is holding the hotkey.
         self.ptt_active = False
+        self.ptt_explicitly_used = False
         self._ptt_timeout_handle: asyncio.Task | None = None
+        # Wake-word arming window: commands are only honored within this many
+        # seconds after a wake word, if WAKE_WORD_WINDOW_SEC > 0.
+        self._wake_armed_until: float = 0.0
 
         # Conversation memory: system prompt is pinned at index 0, followed by
         # alternating user/assistant turns. ConversationHistory enforces the
@@ -234,12 +258,26 @@ class Connection:
             max_history=settings.max_llm_history,
         )
 
+        # Speaker identification: track current speaker for personalization
+        self.speaker_service = None
+        self.current_speaker_id: str | None = None
+        self.current_speaker_name: str | None = None
+        self.speaker_audio_buffer: deque[np.ndarray] = deque()
+        self._speaker_buffer_samples = 0
+        self.speaker_identification_pending = False
+        # Consecutive turns that did not match the current speaker. Used to
+        # drop a stale personalization once the unknown speaker repeats.
+        self._unknown_speaker_streak = 0
+
     def _get_audio(self) -> np.ndarray:
         """The filled prefix of the audio accumulator (no copy)."""
         return self._buffer[: self._audio_length]
 
     async def run(self) -> None:
         """Main entry: start the consumer, drain the socket, then flush."""
+        # Initialize speaker service if enabled
+        await self._init_speaker_service()
+
         self.consumer = asyncio.create_task(self._consume())
         try:
             await self._receive_loop()
@@ -293,8 +331,6 @@ class Connection:
     async def _on_audio(self, data: bytes) -> None:
         if not data:
             return
-        if settings.push_to_talk and not self.ptt_active:
-            return
         if len(data) > settings.max_frame_size:
             log.warning(
                 "rejecting oversized audio frame: %d bytes > %d bytes",
@@ -305,11 +341,28 @@ class Connection:
                 code=1009,
                 reason=f"frame too large (max {settings.max_frame_size} bytes)",
             )
+        # Echo gate: in ``gate`` mode, drop mic audio while the assistant is
+        # speaking so its own playback cannot re-enter the pipeline. In
+        # ``filter`` mode the gate is a no-op (barge-in stays enabled) and the
+        # similarity check in ``_handle_final_utterance`` does the filtering.
+        if not self.echo.should_accept_audio():
+            return
+        # PTT gating: drop audio when not active if either global PTT is enabled
+        # or the client has explicitly used PTT via talk frames.
+        ptt_enabled = settings.push_to_talk or self.ptt_explicitly_used
+        if ptt_enabled and not self.ptt_active:
+            return
         samples = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
         if samples.size == 0:
             return
+
         self._append_audio(samples)
         await self._feed_vad()
+
+        # VAD updates seg_start while processing this frame. Only retain samples
+        # once speech is active, so microphone silence cannot dilute embeddings.
+        if settings.speaker_enabled and self.seg_start is not None:
+            self._buffer_audio_for_speaker_id(samples)
 
     async def _on_text(self, text: str) -> None:
         try:
@@ -325,6 +378,11 @@ class Connection:
             voice = data.get("voice")
             if isinstance(voice, str) and voice.strip():
                 self.tts_voice = voice.strip()
+            voice_enabled = data.get("voice_enabled")
+            if isinstance(voice_enabled, bool):
+                self.tts_enabled = voice_enabled
+                if not voice_enabled:
+                    await self._cancel_tts()
         elif ctype == _CONTROL_STOP:
             self.stopping = True
         elif ctype == _CONTROL_PING:
@@ -339,6 +397,10 @@ class Connection:
         elif ctype == _CONTROL_TALK:
             active = data.get("active")
             if active is not None:
+                if active is False and not self.ptt_active:
+                    # Explicit "PTT is off" from a client that isn't using PTT:
+                    # stop treating this connection as PTT-gated.
+                    self.ptt_explicitly_used = False
                 await self._set_ptt_active(bool(active))
         elif ctype == _CONTROL_CONTROL:
             # Client-side keyword spotter (or equivalent) heard a command
@@ -350,20 +412,49 @@ class Connection:
                 match = route_command("unmute", allowed=MIC_CONTROL_INTENTS)
                 if match is not None:
                     await self._dispatch_command(match)
+        elif ctype == _CONTROL_RESET:
+            # Client is starting a fresh mic session. Drop state that would
+            # otherwise leak across Stop/Start on the same WebSocket.
+            log.info("reset control frame; clearing session state")
+            self.is_muted = False
+            self.ptt_explicitly_used = False
+            self.ptt_active = False
+            self._wake_armed_until = 0.0
+            self.echo.reset_cooldown()
+            self._reset_segment()      # drains the buffer + VAD
+            self._cancel_ptt_timeout()
         # Unknown control messages are ignored for forward compatibility.
 
     async def _set_ptt_active(self, active: bool) -> None:
         if self.ptt_active == active:
             return
         self.ptt_active = active
+        self.ptt_explicitly_used = True  # Client explicitly used PTT
         if active:
             self._reset_ptt_timeout()
             if self.llm_task is not None or self.tts_task is not None:
-                asyncio.create_task(self._cancel_ongoing_turn())
+                cancel_task = asyncio.create_task(self._cancel_ongoing_turn())
+                cancel_task.add_done_callback(
+                    lambda task: self._observe_background_task(
+                        task, "PTT turn cancellation"
+                    )
+                )
         else:
             self._cancel_ptt_timeout()
         # Notify client of PTT state change
         await self._send_raw({"type": "ptt_state", "active": active})
+
+    @staticmethod
+    def _observe_background_task(task: asyncio.Task, label: str) -> None:
+        """Retrieve and log failures from connection-owned fire-and-forget tasks."""
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("%s failed", label)
 
     def _reset_ptt_timeout(self) -> None:
         self._cancel_ptt_timeout()
@@ -374,7 +465,12 @@ class Connection:
 
             def _timeout_cb(t):
                 if not t.cancelled():
-                    asyncio.create_task(self._on_ptt_timeout())
+                    timeout_task = asyncio.create_task(self._on_ptt_timeout())
+                    timeout_task.add_done_callback(
+                        lambda task: self._observe_background_task(
+                            task, "PTT timeout handler"
+                        )
+                    )
 
             self._ptt_timeout_handle.add_done_callback(_timeout_cb)
 
@@ -442,9 +538,15 @@ class Connection:
         if seg.size < self.min_segment_samples:
             return
         self.last_partial_at = self.vad_pointer
-        await self.queue.put(
-            _PendingSegment(seg.copy(), True, False, self._utterance_id)
-        )
+        try:
+            await asyncio.wait_for(
+                self.queue.put(
+                    _PendingSegment(seg.copy(), True, False, self._utterance_id)
+                ),
+                timeout=_PARTIAL_QUEUE_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            log.debug("transcription queue full; dropping partial")
 
     async def _finalize(self, end_sample: int) -> None:
         """Endpoint an utterance and enqueue its final transcription."""
@@ -458,7 +560,36 @@ class Connection:
             self._reset_segment()
             return
         seg = audio[start:end].copy()
-        await self.queue.put(_PendingSegment(seg, False, True, self._utterance_id))
+
+        # Reject VAD false-positives early: measure the segment's RMS before
+        # it costs a Whisper decode. A "silent room" after browser AGC sits
+        # around -45 to -38 dBFS, and Whisper will confidently hallucinate
+        # "Thank you." / "Please subscribe." on that. Dropping here means the
+        # consumer never sees the segment.
+        level_dbfs = audio_dbfs(seg)
+        if level_dbfs < settings.silence_threshold_dbfs:
+            log.debug(
+                "finalize: dropping quiet segment (%.1f dBFS < %.1f dBFS)",
+                level_dbfs,
+                settings.silence_threshold_dbfs,
+            )
+            self._reset_segment()
+            return
+
+        try:
+            await asyncio.wait_for(
+                self.queue.put(
+                    _PendingSegment(seg, False, True, self._utterance_id)
+                ),
+                timeout=_FINAL_QUEUE_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "transcription queue full for %.1fs; dropping final segment",
+                _FINAL_QUEUE_TIMEOUT_SEC,
+            )
+            self._reset_segment()
+            return
         self._utterance_id += 1
         self._reset_segment()
 
@@ -474,7 +605,14 @@ class Connection:
             self._reset_segment()
             return
         seg = audio[start:end].copy()
-        await self.queue.put(_PendingSegment(seg, False, True, self._utterance_id))
+        try:
+            self.queue.put_nowait(
+                _PendingSegment(seg, False, True, self._utterance_id)
+            )
+        except asyncio.QueueFull:
+            log.warning("transcription queue full during shutdown; dropping final segment")
+            self._reset_segment()
+            return
         self._utterance_id += 1
         self._reset_segment()
 
@@ -487,6 +625,19 @@ class Connection:
         ``_feed_vad`` will finalize the segment at that point and call
         ``_reset_segment``, which starts fresh.
         """
+        # If we're not in an active utterance and the buffer is about to overflow,
+        # drop the accumulated silence. Otherwise a long silent session (mic on,
+        # user not talking) fills the buffer with silence; the cap check in
+        # _feed_vad is gated on ``seg_start is not None``, so it never fires and
+        # the buffer never resets. Once full, every future frame is silently
+        # dropped -- this is the "works first time, can't be heard after Stop/Start"
+        # bug, because Connection (and its buffer) survives across mic sessions.
+        if (
+            self.seg_start is None
+            and self._audio_length + samples.size > self._max_buffer_samples
+        ):
+            self._reset_segment()
+
         needed = self._audio_length + samples.size
         if needed > self._buffer.size:
             # Grow geometrically, but never past what one utterance can hold:
@@ -526,6 +677,11 @@ class Connection:
             # Skip stale partials from previous utterances
             if item.is_partial and item.utterance_id < current_utterance_id:
                 continue
+            # Muted mode never sends partials or finals to the cloud STT path.
+            if self.is_muted:
+                if item.is_final:
+                    await self._handle_muted_segment(item)
+                continue
             try:
                 text, confidence = await self.stt.transcribe_async(
                     item.audio, self.language
@@ -540,8 +696,97 @@ class Connection:
                 await self._handle_final_utterance(text)
 
     # ------------------------------------------------------------------ #
-    # LLM + final utterance handling
+    # Speaker Identification
     # ------------------------------------------------------------------ #
+    async def _init_speaker_service(self) -> None:
+        """Initialize the speaker service if enabled."""
+        if settings.speaker_enabled:
+            try:
+                self.speaker_service = await get_speaker_service()
+                log.info("Speaker identification enabled")
+            except Exception as exc:
+                log.warning("Failed to initialize speaker service: %s", exc)
+                self.speaker_service = None
+
+    async def _identify_speaker(self) -> None:
+        """Identify the current speaker from buffered audio."""
+        if not self.speaker_service or not self.speaker_audio_buffer:
+            return
+
+        # Combine buffered audio
+        audio = np.concatenate(tuple(self.speaker_audio_buffer))
+        self.speaker_audio_buffer.clear()
+        self._speaker_buffer_samples = 0
+
+        # Check minimum duration
+        duration = audio.size / settings.sample_rate
+        min_duration = settings.speaker_min_identify_sec
+        if duration < min_duration:
+            log.debug("Speaker ID skipped: audio too short (%.1fs < %.1fs)", duration, min_duration)
+            return
+
+        # Run identification
+        try:
+            result = await self.speaker_service.identify(audio)
+            if result.is_known:
+                # A known speaker clears any pending "not this person" streak,
+                # even when it is the same one as last turn.
+                self._unknown_speaker_streak = 0
+                if result.speaker_id != self.current_speaker_id:
+                    self.current_speaker_id = result.speaker_id
+                    self.current_speaker_name = result.name
+                    log.info("Speaker identified: %s (%.3f)", result.name, result.similarity)
+                    # Notify client of speaker change
+                    await self._send_raw({
+                        "type": "speaker_change",
+                        "speaker_id": result.speaker_id,
+                        "name": result.name,
+                        "similarity": round(result.similarity, 4),
+                    })
+            else:
+                self._unknown_speaker_streak += 1
+                log.debug(
+                    "Unknown speaker (best similarity: %.3f, streak=%d)",
+                    result.similarity,
+                    self._unknown_speaker_streak,
+                )
+                if self._unknown_speaker_streak >= _UNKNOWN_SPEAKER_RESET_STREAK:
+                    self._unknown_speaker_streak = 0
+                    if self.current_speaker_name is not None:
+                        # The voice that last set the personalization is not
+                        # talking any more. Drop it so the next turn is not
+                        # answered as the wrong person.
+                        log.info(
+                            "Speaker context cleared (unknown for %d consecutive turns)",
+                            _UNKNOWN_SPEAKER_RESET_STREAK,
+                        )
+                        self.current_speaker_id = None
+                        self.current_speaker_name = None
+                        await self._send_raw({
+                            "type": "speaker_change",
+                            "speaker_id": None,
+                            "name": None,
+                            "similarity": round(result.similarity, 4),
+                        })
+        except Exception as exc:
+            log.warning("Speaker identification failed: %s", exc)
+
+    def _buffer_audio_for_speaker_id(self, audio: np.ndarray) -> None:
+        """Buffer audio for speaker identification."""
+        if self.speaker_service is None:
+            return
+        self.speaker_audio_buffer.append(audio.copy())
+        self._speaker_buffer_samples += audio.size
+        max_samples = int(
+            settings.speaker_max_identify_sec * settings.sample_rate
+        )
+        while (
+            self._speaker_buffer_samples > max_samples
+            and self.speaker_audio_buffer
+        ):
+            removed = self.speaker_audio_buffer.popleft()
+            self._speaker_buffer_samples -= removed.size
+
     async def _handle_final_utterance(self, text: str, confidence: float = 1.0) -> None:
         """After a final transcript: try deterministic intents first, then LLM.
 
@@ -568,18 +813,56 @@ class Connection:
             log.info("echo guard: dropped self-referential transcript %r", text[:60])
             return
 
+        # Speaker ID updates state for the next turn. Keep model inference off
+        # this turn's intent, LLM, and TTS path.
+        if (
+            settings.speaker_enabled
+            and self.speaker_service is not None
+            and not self.speaker_identification_pending
+        ):
+            self.speaker_identification_pending = True
+            task = asyncio.create_task(self._identify_speaker())
+            task.add_done_callback(
+                lambda completed: self._observe_background_task(
+                    completed, "speaker identification"
+                )
+            )
+            task.add_done_callback(
+                lambda _completed: setattr(
+                    self, "speaker_identification_pending", False
+                )
+            )
+
         # Try deterministic intent routing first.
-        match = route_command(text, confidence)
+        now = time.monotonic()
+        wake_ok = now < self._wake_armed_until
+        match = route_command(text, confidence, wake_word_ok=wake_ok)
         if match is not None:
             await self._dispatch_command(match)
             return
 
         # Build the message list: system prompt + trimmed history + new user turn.
-        messages = build_messages(
-            self.history, text, max_history=settings.max_llm_history
+        # Include speaker context if available
+        if self.current_speaker_name:
+            # Augment the FULL system prompt (today's date + TTS contract + search
+            # rules) with speaker identity. Previously this used
+            # ``settings.llm_system_prompt`` directly, which silently dropped the
+            # date and all TTS rules the moment a speaker was identified.
+            contextualized_prompt = (
+                f"{build_system_prompt()} The current user is {self.current_speaker_name}."
+            )
+            messages = build_messages(
+                self.history, text, max_history=settings.max_llm_history,
+                system_prompt=contextualized_prompt
+            )
+        else:
+            messages = build_messages(
+                self.history, text, max_history=settings.max_llm_history
+            )
+        # Keep the self-trimming container after build_messages returns a list.
+        self.history = ConversationHistory(
+            messages, max_history=settings.max_llm_history
         )
-        # Keep history in sync (replaces any stale trimming).
-        self.history = messages
 
         if llm_service.enabled:
             self._spawn_llm_turn(messages, fallback_text=text)
@@ -618,6 +901,10 @@ class Connection:
                 await self._start_tts(match.confirmation)
             return
 
+        if match.intent == "play_youtube":
+            await self._dispatch_youtube_play(match)
+            return
+
         if match.intent == "mute_mic":
             self.is_muted = True
         elif match.intent == "unmute_mic":
@@ -645,6 +932,45 @@ class Connection:
 
         if speak:
             await self._start_tts(match.confirmation)
+
+    async def _dispatch_youtube_play(self, match: IntentMatch) -> None:
+        """Resolve a YouTube search and emit a ``play_youtube`` command.
+
+        The search runs on the server so the browser receives a ready-to-play
+        ``watch?v=...`` URL. If the search fails (network, rate-limit, no
+        results, yt-dlp not installed) we fall back to the search-results URL
+        so the user still lands somewhere useful.
+
+        TTS is deliberately **not** spoken here: the browser navigates a
+        pre-opened player tab to the video, and any speech would overlap with
+        the song's audio.
+        """
+        query = (match.slots.get("query") or "").strip()
+        if not query:
+            return
+
+        # If the assistant is currently talking, stop so the video doesn't
+        # compete with its voice.
+        await self._cancel_ongoing_turn()
+
+        yt = await search_youtube(query)
+
+        event: dict = {
+            "type": "command",
+            "intent": "play_youtube",
+            "slots": {
+                "query": query,
+                "video_id": yt.video_id if yt else None,
+                "title": yt.title if yt else None,
+                "url": yt.url if yt else fallback_search_url(query),
+                "resolved": bool(yt),
+            },
+            "raw": match.raw,
+            "normalized": match.normalized,
+        }
+        if match.wake_word:
+            event["wake_word"] = match.wake_word
+        await self._send_raw(event)
 
     async def _handle_muted_segment(self, item: _PendingSegment) -> None:
         """Muted-mode transcription: local keyword pass only, never the cloud.
@@ -684,12 +1010,13 @@ class Connection:
         )
 
     async def _cancel_ongoing_turn(self) -> None:
-        """Abort any in-progress LLM generation and TTS playback.
-
-        Called when the user starts speaking again (barge-in) so the assistant
-        does not keep talking over the user.
-        """
-        # Cancel the LLM streaming task.
+        """Abort both the in-progress LLM stream task and any in-flight TTS."""
+        had_turn = (self.tts_task is not None and not self.tts_task.done()) or (
+            self.llm_task is not None and not self.llm_task.done()
+        )
+        # Cancel TTS task
+        await self._cancel_tts()
+        # Cancel LLM task
         task, self.llm_task = self.llm_task, None
         if task is not None and not task.done():
             task.cancel()
@@ -699,17 +1026,35 @@ class Connection:
                 pass
             except Exception:
                 log.exception("LLM task failed while cancelling")
-        # Cancel any in-flight TTS.
-        await self._cancel_tts()
+        if had_turn:
+            # The user interrupted us: clear the post-playback cooldown so their
+            # own voice is not gated away. (The echo history is left intact -- a
+            # partial barge-in is not a reason to forget what we just said.)
+            self.echo.reset_cooldown()
 
-    async def _stream_llm_turn(self, messages: list[dict], fallback_text: str) -> None:
+    async def _cancel_tts(self) -> None:
+        """Cancel any in-flight TTS synthesis."""
+        task, self.tts_task = self.tts_task, None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("TTS task failed while cancelling")
+
+    async def _stream_llm_turn(
+        self, messages: list[MessageParam], fallback_text: str
+    ) -> None:
         """Stream LLM sentences to TTS, appending the reply to history.
 
         Each completed sentence is sent to the client as an ``llm_response``
-        event and simultaneously fed to ``synthesize_stream`` for speech output.
-        If the LLM fails entirely, the fallback text (raw transcript) is spoken.
-        When a tool call is detected, a short filler line is spoken before the
-        search runs.
+        event and simultaneously queued for speech output. A background TTS
+        consumer task pulls from the queue, overlapping the edge-tts fetch of
+        sentence N+1 with audio playback of sentence N so the LLM stream is
+        never blocked waiting for synthesis.
         """
         started = time.perf_counter()
         total_bytes = 0
@@ -720,24 +1065,98 @@ class Connection:
         if llm_service.enabled:
             tools = [WEB_SEARCH_TOOL_SCHEMA]
 
+        # Queue-based decoupling: the LLM producer pushes sentences onto this
+        # queue and never awaits TTS playback. The TTS consumer pulls batches
+        # (up to TTS_PREFETCH) and runs synthesize_stream concurrently with the
+        # next LLM sentence being produced.
+        tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        async def tts_consumer() -> None:
+            """Pull sentence batches from the queue and synthesize them.
+
+            A None sentinel signals shutdown. Batches are formed with a short
+            150 ms deadline so a slow LLM does not hold a single sentence
+            indefinitely (latency ≈ first audio byte of *that* sentence).
+            """
+            while True:
+                first = await tts_queue.get()
+                if first is None:
+                    return
+                # Batch waiting in the queue so synthesize_stream can prefetch
+                # multiple sentences concurrently.
+                batch: list[str] = [first]
+                deadline = time.perf_counter() + 0.15
+                while len(batch) < settings.tts_prefetch:
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        break
+                    try:
+                        nxt = await asyncio.wait_for(
+                            tts_queue.get(), timeout=remaining
+                        )
+                    except asyncio.TimeoutError:
+                        break
+                    if nxt is None:
+                        await play_text(" ".join(batch))
+                        return
+                    batch.append(nxt)
+                await play_text(" ".join(batch))
+
+        async def play_text(text: str) -> None:
+            """Synthesize and stream a single text to audio, tracking bytes."""
+            nonlocal total_bytes
+            self.echo.begin_speech(text)
+            try:
+                async with contextlib.aclosing(
+                    synthesize_stream(text, self.tts_voice)
+                ) as audio_stream:
+                    async for item in audio_stream:
+                        if not self.tts_enabled:
+                            break
+                        if isinstance(item, dict):
+                            event = {**item, "type": "tts_error"}
+                            errors.append(event)
+                            await self._send_raw(event)
+                            continue
+                        total_bytes += len(item)
+                        if not await self._send_bytes(item):
+                            return
+            finally:
+                self.echo.end_speech()
+
+        tts_task = asyncio.create_task(tts_consumer())
+
         try:
             async with contextlib.aclosing(
                 llm_service.stream_response(
-                    messages, fallback_text=fallback_text, tools=tools, tool_choice="auto"
+                    messages,
+                    fallback_text=fallback_text,
+                    tools=tools,
+                    tool_choice="auto",
                 )
             ) as agen:
                 async for sentence, model in agen:
-                    if sentence is None and isinstance(model, str) and model.startswith("tool_call:"):
+                    # tool_call sentinel — flush queued sentences first so
+                    # prefetch order is preserved, then speak filler.
+                    if (
+                        sentence is None
+                        and isinstance(model, str)
+                        and model.startswith("tool_call:")
+                    ):
+                        # Drain the queue: put a None sentinel so the consumer
+                        # finishes the current batch, then send the filler.
+                        await tts_queue.put(None)
+                        await tts_task
+                        tts_task = asyncio.create_task(tts_consumer())
+                        if not self.tts_enabled:
+                            continue
                         tool_name = model.split(":", 1)[1]
-                        filler = "Let me check that." if tool_name == "web_search" else "Let me check."
-                        async for item in synthesize_stream(filler, self.tts_voice):
-                            if isinstance(item, dict):
-                                event = {**item, "type": "tts_error"}
-                                errors.append(event)
-                                await self._send_raw(event)
-                                continue
-                            total_bytes += len(item)
-                            await self._send_bytes(item)
+                        filler = (
+                            "Let me check that."
+                            if tool_name == "web_search"
+                            else "Let me check."
+                        )
+                        await play_text(filler)
                         continue
 
                     full_response_parts.append(sentence)
@@ -748,20 +1167,42 @@ class Connection:
                             "model": model,
                         }
                     )
-                    # Feed this sentence directly to TTS for immediate playback.
-                    async for item in synthesize_stream(sentence, self.tts_voice):
-                        if isinstance(item, dict):
-                            event = {**item, "type": "tts_error"}
-                            errors.append(event)
-                            await self._send_raw(event)
-                            continue
-                        total_bytes += len(item)
-                        await self._send_bytes(item)
+                    if self.tts_enabled:
+                        await tts_queue.put(sentence)
+
+            # Empty-stream guard: some models — notably CF llama-3.2-3b when
+            # offered a tools schema — return an empty completion. Without this
+            # check the turn produces no llm_response event, no audio, and no
+            # history entry: a fully silent dead turn.
+            if not full_response_parts:
+                log.warning(
+                    "LLM stream produced no sentences (empty stream); "
+                    "speaking fallback transcript so the turn is not silent"
+                )
+                await self._send_raw({
+                    "type": "llm_response",
+                    "text": fallback_text,
+                    "model": "fallback:empty-stream",
+                })
+                if self.tts_enabled:
+                    await tts_queue.put(fallback_text)
+                full_response_parts.append(fallback_text)
+
+            # Signal the consumer to drain and finish.
+            await tts_queue.put(None)
+            await tts_task
+
         except asyncio.CancelledError:
             # Barge-in: discard the partial response, do not record it in history.
+            tts_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await tts_task
             log.debug("LLM stream cancelled (barge-in)")
             return
         except Exception as exc:  # noqa: BLE001 — fallback to TTS with transcript
+            tts_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await tts_task
             log.warning(
                 "LLM streaming failed (%s: %s); speaking transcript",
                 type(exc).__name__,
@@ -769,14 +1210,8 @@ class Connection:
             )
             await self._send_raw({"type": "llm_error", "error": str(exc)})
             # Speak the raw transcript as a fallback.
-            async for item in synthesize_stream(fallback_text, self.tts_voice):
-                if isinstance(item, dict):
-                    event = {**item, "type": "tts_error"}
-                    errors.append(event)
-                    await self._send_raw(event)
-                else:
-                    total_bytes += len(item)
-                    await self._send_bytes(item)
+            if self.tts_enabled:
+                await play_text(fallback_text)
             full_response_parts.append(fallback_text)
 
         # Record the assistant turn in conversation history.
@@ -787,11 +1222,6 @@ class Connection:
                 "content": full_response,
             }
             self.history.append(assistant_msg)
-            # Trim to the configured window, preserving the system prompt.
-            if len(self.history) > settings.max_llm_history:
-                self.history = [self.history[0]] + self.history[
-                    -(settings.max_llm_history - 1) :
-                ]
 
         elapsed_ms = (time.perf_counter() - started) * 1000
         await self._send_raw(
@@ -810,24 +1240,14 @@ class Connection:
     # ------------------------------------------------------------------ #
     async def _start_tts(self, text: str, voice: str | None = None) -> None:
         """(Re)start speech synthesis, cancelling anything already playing."""
+        if not self.tts_enabled:
+            return
         if settings.push_to_talk:
             await self._set_ptt_active(False)
         await self._cancel_ongoing_turn()
-        self.tts_task = asyncio.create_task(self._speak(text, voice or self.tts_voice))
+        self.tts_task = asyncio.create_task(self._speak_tts(text, voice or self.tts_voice))
 
-    async def _cancel_tts(self) -> None:
-        task, self.tts_task = self.tts_task, None
-        if task is None or task.done():
-            return
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            log.exception("TTS task failed while cancelling")
-
-    async def _speak(self, text: str, voice: str) -> None:
+    async def _speak_tts(self, text: str, voice: str) -> None:
         """Stream synthesized PCM as binary frames, then a completion event.
 
         Synthesis failures are reported per sentence as ``tts_error`` events so
@@ -837,14 +1257,23 @@ class Connection:
         total_bytes = 0
         errors: list[dict] = []
 
-        async for item in synthesize_stream(text, voice):
-            if isinstance(item, dict):
-                event = {**item, "type": "tts_error"}
-                errors.append(event)
-                await self._send_raw(event)
-                continue
-            total_bytes += len(item)
-            await self._send_bytes(item)
+        # Remember what is being said so the echo guard can recognize its
+        # own playback when it leaks back through the mic.
+        self.echo.begin_speech(text)
+        try:
+            async with contextlib.aclosing(synthesize_stream(text, voice)) as audio_stream:
+                async for item in audio_stream:
+                    if isinstance(item, dict):
+                        event = {**item, "type": "tts_error"}
+                        errors.append(event)
+                        await self._send_raw(event)
+                        continue
+                    total_bytes += len(item)
+                    if not await self._send_bytes(item):
+                        log.debug("client disconnected during TTS; stopping synthesis")
+                        return
+        finally:
+            self.echo.end_speech()
 
         elapsed_ms = (time.perf_counter() - started) * 1000
         await self._send_raw(

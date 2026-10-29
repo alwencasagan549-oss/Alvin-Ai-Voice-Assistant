@@ -1,7 +1,26 @@
-"""Web search module for the Alvin voice assistant.
+"""Web search for the Alvin voice assistant.
 
-Provides a `web_search` function with Tavily as primary and DuckDuckGo as fallback,
-5-minute in-memory cache, and formatted output suitable for LLM tool calls.
+Tavily (primary) + DuckDuckGo (fallback), 5-minute in-memory cache, formatted
+for LLM tool calls.
+
+Fixes vs. the previous version:
+
+* The Tavily synthesized ``answer`` is now included in the output. It was paid
+  for (``include_answer=True``) and then thrown away, so the LLM only saw raw
+  snippets and often answered worse than Tavily's own summary.
+* ``TavilyClient`` and ``DDGS`` are cached across calls. Recreating them per
+  search paid a TLS handshake inside an 8s budget, which is why searches
+  "randomly" timed out.
+* ``topic`` is normalized once before the API call. ``"News"`` used to fail the
+  ``topic == "news"`` check and reach Tavily as an invalid enum.
+* Empty Tavily results (``[]``) now fall through to DDG. Only ``None`` (an
+  exception) triggered the fallback before, so a successful-but-empty search
+  was cached as "No results found." for 5 minutes.
+* ``.get(key, "")`` is replaced with ``.get(key) or ""`` so explicit JSON
+  ``null`` values do not crash ``_format_results``.
+* The DDG import tries both package names (``ddgs`` and ``duckduckgo_search``).
+* News results include the published date when Tavily provides one.
+* Cache is bounded by both TTL and a hard entry cap.
 """
 
 from __future__ import annotations
@@ -10,191 +29,269 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from functools import lru_cache
-from typing import Any
 
 from .config import settings
 
 log = logging.getLogger("alvin.web_search")
 
+_CACHE_TTL = 300.0        # seconds
+_CACHE_MAX_ENTRIES = 500  # hard cap
+_SEARCH_TIMEOUT = 8.0     # per-provider budget, seconds
+_DEFAULT_MAX_RESULTS = 3
+_SNIPPET_LEN = 400
+
 
 @dataclass
 class SearchResult:
-    """A single search result."""
     title: str
     url: str
     content: str
     domain: str
+    published: str | None = None
 
 
-def _extract_domain(url: str) -> str:
-    """Extract domain from URL."""
+# ── client caches ─────────────────────────────────────────────────────────
+# Rebuilding these per call was the root cause of intermittent timeouts:
+# each fresh TavilyClient opens a new httpx pool and pays a TLS handshake
+# inside an 8 s budget.
+_tavily_client = None
+_tavily_key_used: str | None = None
+_tavily_import_failed = False
+
+_ddg_cls = None
+_ddg_import_failed = False
+
+
+def _get_tavily_client():
+    global _tavily_client, _tavily_key_used, _tavily_import_failed
+    if _tavily_import_failed:
+        return None
+    api_key = (settings.tavily_api_key or "").strip()
+    if not api_key:
+        return None
+    if _tavily_client is not None and _tavily_key_used == api_key:
+        return _tavily_client
+    try:
+        from tavily import TavilyClient
+    except ImportError as exc:
+        _tavily_import_failed = True  # log once, not on every search
+        log.error("tavily-python is not installed: %s", exc)
+        return None
+    _tavily_client = TavilyClient(api_key=api_key)
+    _tavily_key_used = api_key
+    return _tavily_client
+
+
+def _get_ddg_cls():
+    global _ddg_cls, _ddg_import_failed
+    if _ddg_cls is not None or _ddg_import_failed:
+        return _ddg_cls
+    for module_name in ("ddgs", "duckduckgo_search"):
+        try:
+            module = __import__(module_name, fromlist=["DDGS"])
+            _ddg_cls = getattr(module, "DDGS")
+            return _ddg_cls
+        except ImportError:
+            continue
+    _ddg_import_failed = True
+    log.error(
+        "Neither 'ddgs' nor 'duckduckgo-search' is installed; "
+        "web search will only work when Tavily succeeds."
+    )
+    return None
+
+
+def _extract_domain(url: str | None) -> str:
+    if not url:
+        return "unknown"
     try:
         from urllib.parse import urlparse
-        return urlparse(url).netloc.replace("www.", "")
+        return urlparse(url).netloc.replace("www.", "") or "unknown"
     except Exception:
         return "unknown"
 
 
-def _format_results(results: list[SearchResult], max_results: int = 3) -> str:
-    """Format search results as plain text for LLM consumption."""
-    if not results:
+def _normalize_topic(topic: str | None) -> str:
+    """Clamp to the only two values Tavily / DDG accept."""
+    return "news" if (topic or "").strip().lower() == "news" else "general"
+
+
+def _format_results(
+    results: list[SearchResult],
+    answer: str | None = None,
+    max_results: int = _DEFAULT_MAX_RESULTS,
+) -> str:
+    if not results and not answer:
         return "No results found."
-    
-    lines = []
-    for i, r in enumerate(results[:max_results], 1):
-        snippet = r.content[:400]
-        lines.append(f"[{r.domain}] {r.title}: {snippet}")
+
+    lines: list[str] = []
+    # Tavily's synthesized answer is the highest-signal line for the LLM.
+    if answer:
+        lines.append(f"Summary: {answer}")
+
+    for r in results[:max_results]:
+        prefix = f"[{r.domain}]"
+        if r.published:
+            prefix = f"{prefix} ({r.published})"
+        title = r.title or "(untitled)"
+        snippet = (r.content or "")[:_SNIPPET_LEN]
+        lines.append(f"{prefix} {title}: {snippet}")
     return "\n".join(lines)
 
 
-async def _tavily_search(query: str, topic: str, max_results: int) -> list[SearchResult] | None:
-    """Search using Tavily API. Returns None on failure."""
-    api_key = getattr(settings, "tavily_api_key", "") or ""
-    if not api_key:
-        log.debug("Tavily API key not configured")
-        return None
-    
-    try:
-        from tavily import TavilyClient
-        client = TavilyClient(api_key=api_key)
-        
-        search_depth = "basic"
-        include_answer = True
-        time_range = "week" if topic == "news" else None
-        
-        # Run in thread pool since TavilyClient is synchronous
-        loop = asyncio.get_running_loop()
-        response = await asyncio.wait_for(
-            loop.run_in_executor(
-                None,
-                lambda: client.search(
-                    query=query,
-                    search_depth=search_depth,
-                    include_answer=include_answer,
-                    max_results=max_results,
-                    topic=topic,
-                    time_range=time_range,
-                ),
-            ),
-            timeout=8.0,
-        )
-        
-        results = []
-        for item in response.get("results", []):
-            results.append(SearchResult(
-                title=item.get("title", ""),
-                url=item.get("url", ""),
-                content=item.get("content", ""),
-                domain=_extract_domain(item.get("url", "")),
-            ))
-        return results
-        
-    except Exception as exc:
-        log.warning("Tavily search failed: %s", exc)
-        return None
+async def _tavily_search(
+    query: str, topic: str, max_results: int
+) -> tuple[list[SearchResult], str | None]:
+    """Return ``(results, answer)``. Raises on hard failure."""
+    client = _get_tavily_client()
+    if client is None:
+        return [], None  # not configured — caller falls back to DDG
+
+    topic = _normalize_topic(topic)  # bug #4
+    kwargs: dict = {
+        "query": query,
+        "search_depth": "basic",
+        "include_answer": "basic",        # bug #1: now consumed below
+        "max_results": max_results,
+        "topic": topic,
+    }
+    if topic == "news":
+        kwargs["time_range"] = "week"
+
+    loop = asyncio.get_running_loop()
+    response = await asyncio.wait_for(
+        loop.run_in_executor(None, lambda: client.search(**kwargs)),
+        timeout=_SEARCH_TIMEOUT,
+    )
+
+    results: list[SearchResult] = []
+    for item in response.get("results") or []:
+        url = item.get("url") or ""          # bug #6
+        results.append(SearchResult(
+            title=item.get("title") or "",
+            url=url,
+            content=item.get("content") or "",
+            domain=_extract_domain(url),
+            published=item.get("published_date") or None,  # bug #9
+        ))
+    return results, response.get("answer") or None   # bug #1
 
 
-async def _duckduckgo_search(query: str, topic: str, max_results: int) -> list[SearchResult] | None:
-    """Search using DuckDuckGo via ddgs. Returns None on failure."""
-    try:
-        from ddgs import DDGS
-        
-        # Run in thread pool since DDGS is synchronous
-        loop = asyncio.get_running_loop()
-        
-        def _search():
-            with DDGS() as ddgs:
-                if topic == "news":
-                    return list(ddgs.news(query, max_results=max_results))
-                return list(ddgs.text(query, max_results=max_results))
-        
-        raw_results = await asyncio.wait_for(
-            loop.run_in_executor(None, _search),
-            timeout=8.0,
-        )
-        
-        results = []
-        for item in raw_results:
-            results.append(SearchResult(
-                title=item.get("title", ""),
-                url=item.get("href", item.get("url", "")),
-                content=item.get("body", item.get("snippet", "")),
-                domain=_extract_domain(item.get("href", item.get("url", ""))),
-            ))
-        return results
-        
-    except Exception as exc:
-        log.warning("DuckDuckGo search failed: %s", exc)
-        return None
+async def _duckduckgo_search(
+    query: str, topic: str, max_results: int
+) -> list[SearchResult]:
+    """Return DDG results. Raises on hard failure."""
+    DDGS = _get_ddg_cls()          # bug #7
+    if DDGS is None:
+        return []
+
+    topic = _normalize_topic(topic)  # bug #4
+
+    def _search():
+        with DDGS() as ddgs:
+            raw = ddgs.news(query, max_results=max_results) \
+                if topic == "news" \
+                else ddgs.text(query, max_results=max_results)
+            return list(raw or [])
+
+    loop = asyncio.get_running_loop()
+    raw_results = await asyncio.wait_for(
+        loop.run_in_executor(None, _search),
+        timeout=_SEARCH_TIMEOUT,
+    )
+
+    results: list[SearchResult] = []
+    for item in raw_results:
+        url = item.get("href") or item.get("url") or ""   # bug #6
+        results.append(SearchResult(
+            title=item.get("title") or "",
+            url=url,
+            content=item.get("body") or item.get("snippet") or "",
+            domain=_extract_domain(url),
+            published=item.get("date") or None,           # bug #9
+        ))
+    return results
 
 
-# 5-minute cache (300 seconds)
-_SEARCH_CACHE: dict[tuple[str, str], tuple[float, str]] = {}
-_CACHE_TTL = 300  # seconds
+# ── cache ─────────────────────────────────────────────────────────────────
+_SEARCH_CACHE: dict[tuple[str, str, int], tuple[float, str]] = {}
 
 
-def _cache_key(query: str, topic: str) -> tuple[str, str]:
-    return (query.lower().strip(), topic.lower().strip())
+def _cache_key(query: str, topic: str, max_results: int) -> tuple[str, str, int]:
+    return (
+        " ".join((query or "").lower().split()),
+        _normalize_topic(topic),
+        max_results,
+    )
 
 
-async def web_search(query: str, topic: str = "general", max_results: int = 3) -> str:
-    """Search the web and return formatted plain text results.
-    
-    Args:
-        query: The search query.
-        topic: "general" or "news".
-        max_results: Maximum number of results to return (default 3).
-    
-    Returns:
-        Formatted plain text with summary and up to 3 results.
-        Never raises; on total failure returns an error message.
+def _evict_if_needed(now: float) -> None:
+    """TTL first, then hard cap by oldest timestamp (bugs #10, #12)."""
+    cutoff = now - _CACHE_TTL
+    for key in [k for k, (ts, _) in _SEARCH_CACHE.items() if ts <= cutoff]:
+        _SEARCH_CACHE.pop(key, None)
+
+    if len(_SEARCH_CACHE) > _CACHE_MAX_ENTRIES:
+        overflow = len(_SEARCH_CACHE) - _CACHE_MAX_ENTRIES
+        oldest = sorted(_SEARCH_CACHE.items(), key=lambda kv: kv[1][0])[:overflow]
+        for key, _ in oldest:
+            _SEARCH_CACHE.pop(key, None)
+
+
+async def web_search(
+    query: str,
+    topic: str = "general",
+    max_results: int = _DEFAULT_MAX_RESULTS,
+) -> str:
+    """Search the web and return formatted plain text for the LLM.
+
+    Never raises; on total failure returns a ``SEARCH_FAILED`` marker.
     """
-    key = _cache_key(query, topic)
+    key = _cache_key(query, topic, max_results)
     now = time.time()
-    
-    # Check cache
-    if key in _SEARCH_CACHE:
-        cached_time, cached_result = _SEARCH_CACHE[key]
-        if now - cached_time < _CACHE_TTL:
-            log.debug("Cache hit for query: %s", query)
-            return cached_result
-    
-    # Try Tavily first
-    results = await _tavily_search(query, topic, max_results)
-    
-    # Fallback to DuckDuckGo
-    if results is None:
-        log.info("Tavily failed or unavailable, falling back to DuckDuckGo")
-        results = await _duckduckgo_search(query, topic, max_results)
-    
-    # Total failure
-    if results is None:
-        error_msg = "SEARCH_FAILED: web search is unavailable right now."
-        log.error("Both Tavily and DuckDuckGo failed for query: %s", query)
-        return error_msg
-    
-    formatted = _format_results(results, max_results)
-    
-    # Cache the result
+
+    cached = _SEARCH_CACHE.get(key)
+    if cached and now - cached[0] < _CACHE_TTL:
+        log.debug("cache hit for %r", key)
+        return cached[1]
+
+    results: list[SearchResult] = []
+    answer: str | None = None
+
+    try:
+        results, answer = await _tavily_search(query, topic, max_results)
+    except Exception as exc:  # noqa: BLE001 - fall through to DDG
+        log.warning("Tavily failed for %r: %s", query, exc)
+
+    # Bug #5: fall back on "no results OR no answer", not just on exception.
+    if not results and not answer:
+        try:
+            results = await _duckduckgo_search(query, topic, max_results)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("DuckDuckGo failed for %r: %s", query, exc)
+            results = []
+
+    if not results and not answer:
+        log.error("both providers returned nothing for %r", query)
+        return "SEARCH_FAILED: web search is unavailable right now."
+
+    formatted = _format_results(results, answer=answer, max_results=max_results)
     _SEARCH_CACHE[key] = (now, formatted)
-    
-    # Clean old cache entries (simple LRU-ish cleanup)
-    if len(_SEARCH_CACHE) > 100:
-        cutoff = now - _CACHE_TTL
-        for k in list(_SEARCH_CACHE.keys()):
-            if _SEARCH_CACHE[k][0] <= cutoff:
-                del _SEARCH_CACHE[k]
-    
+    _evict_if_needed(now)
     return formatted
 
 
-# Tool schema for LLM function calling
+# ── tool schema (unchanged, but made explicit) ────────────────────────────
 WEB_SEARCH_TOOL_SCHEMA = {
     "type": "function",
     "function": {
         "name": "web_search",
-        "description": "Search the web for current information. Use 'topic=news' for current events, recent news, live scores, prices, rankings, or anything that changes frequently. Use 'topic=general' for stable knowledge, how-to guides, or explanations.",
+        "description": (
+            "Search the web for current information. Use 'topic=news' for current "
+            "events, recent news, live scores, prices, rankings, or anything that "
+            "changes frequently. Use 'topic=general' for stable knowledge, how-to "
+            "guides, or explanations."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -205,7 +302,7 @@ WEB_SEARCH_TOOL_SCHEMA = {
                 "topic": {
                     "type": "string",
                     "enum": ["general", "news"],
-                    "description": "Search topic: 'general' for most queries, 'news' for current events, recent news.",
+                    "description": "Search topic: 'general' or 'news'.",
                     "default": "general",
                 },
             },

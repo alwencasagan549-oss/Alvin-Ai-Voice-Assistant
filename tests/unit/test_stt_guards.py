@@ -101,6 +101,10 @@ def test_silence_gate_is_far_under_two_milliseconds():
 
 def test_quiet_but_audible_audio_still_reaches_a_backend(monkeypatch):
     """A -30 dBFS buffer is quiet, not silent: it must not be dropped."""
+    # The test environment forces GROQ_FALLBACK=false via conftest; enable it
+    # for this test so the Groq -> local fallback path is exercised.
+    settings.groq_fallback = True
+
     service = STTService()
     seen: list[int] = []
 

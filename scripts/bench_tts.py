@@ -9,7 +9,7 @@ Usage::
     python scripts\\bench_tts.py
     python scripts\\bench_tts.py --repeat 3 --text "Your custom sentence."
 
-Matrix mode A/Bs the two deterministic TTS knobs (``TTS_TRIM_EDGE_MS`` and
+Matrix mode A/Bs the two deterministic TTS knobs (``TTS_TRIM_TRAILING_MS`` and
 ``TTS_DECODE_INTERVAL_BYTES``) with N samples per cell, after one discarded
 warm-up request per cell::
 
@@ -53,7 +53,7 @@ FIXTURE = ROOT / "tests" / "data" / "sample_speech.wav"
 # Used when the fixture or the STT leg is unavailable, so the matrix still runs.
 FALLBACK_TEXT = "Hey, what time is it?"
 
-# (label, trim_edge_ms, decode_interval_bytes)
+# (label, trim_trailing_ms, decode_interval_bytes)
 MATRIX_CELLS: list[tuple[str, int, int]] = [
     ("A baseline", 200, 8192),
     ("B low-decode-interval", 200, 2048),
@@ -356,7 +356,7 @@ async def measure_interleaved(
     a per-round paired difference cancels slow drift.
     """
     for _label, trim, interval in MATRIX_CELLS:
-        settings.tts_trim_edge_ms = trim
+        settings.tts_trim_trailing_ms = trim
         settings.tts_decode_interval_bytes = interval
         async for _chunk in synthesize_pcm(text):  # discarded warm-up per cell
             pass
@@ -368,7 +368,7 @@ async def measure_interleaved(
     failures = 0
     for round_index in range(samples):
         for label, trim, interval in MATRIX_CELLS:
-            settings.tts_trim_edge_ms = trim
+            settings.tts_trim_trailing_ms = trim
             settings.tts_decode_interval_bytes = interval
             outcome = await time_one(text)
             if outcome is None:
@@ -391,7 +391,7 @@ async def measure_interleaved(
 async def run_matrix(samples: int, interleave: bool = False) -> int:
     """Run the 4-cell A/B matrix and print per-cell TTFA statistics."""
     print("=" * 78)
-    print(" MATRIX TEST -- TTS_TRIM_EDGE_MS x TTS_DECODE_INTERVAL_BYTES")
+    print(" MATRIX TEST -- TTS_TRIM_TRAILING_MS x TTS_DECODE_INTERVAL_BYTES")
     print("=" * 78)
     print(f"voice        : {settings.tts_voice}")
     print(f"edge-tts     : {edge_tts.__version__}")
@@ -406,7 +406,7 @@ async def run_matrix(samples: int, interleave: bool = False) -> int:
     print(f"ingest       : {note}")
 
     results: list[tuple[str, int, int, dict[str, float], list[int], list[float]]] = []
-    original = (settings.tts_trim_edge_ms, settings.tts_decode_interval_bytes)
+    original = (settings.tts_trim_trailing_ms, settings.tts_decode_interval_bytes)
     try:
         if interleave:
             collected = await measure_interleaved(text, samples)
@@ -417,7 +417,7 @@ async def run_matrix(samples: int, interleave: bool = False) -> int:
                 )
         else:
             for label, trim, interval in MATRIX_CELLS:
-                settings.tts_trim_edge_ms = trim
+                settings.tts_trim_trailing_ms = trim
                 settings.tts_decode_interval_bytes = interval
                 print()
                 print(f"   [{label}] trim={trim}ms decode_interval={interval}B")
@@ -430,7 +430,7 @@ async def run_matrix(samples: int, interleave: bool = False) -> int:
                     f"sd {stats['stdev']:,.1f} ms"
                 )
     finally:
-        settings.tts_trim_edge_ms, settings.tts_decode_interval_bytes = original
+        settings.tts_trim_trailing_ms, settings.tts_decode_interval_bytes = original
 
     print()
     print("=" * 78)
@@ -517,7 +517,7 @@ async def main() -> int:
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--text", default=None)
     parser.add_argument("--prefetch", type=int, default=None)
-    parser.add_argument("--trim-edge-ms", type=int, default=None)
+    parser.add_argument("--trim-trailing-ms", type=int, default=None)
     parser.add_argument("--decode-interval-bytes", type=int, default=None)
     parser.add_argument("--gap-ms", type=int, default=None)
     parser.add_argument(
@@ -544,7 +544,7 @@ async def main() -> int:
 
     for attr, value in (
         ("tts_prefetch", args.prefetch),
-        ("tts_trim_edge_ms", args.trim_edge_ms),
+        ("tts_trim_trailing_ms", args.trim_trailing_ms),
         ("tts_decode_interval_bytes", args.decode_interval_bytes),
         ("tts_sentence_gap_ms", args.gap_ms),
     ):
@@ -556,7 +556,7 @@ async def main() -> int:
     print(f"repeat       : {args.repeat}")
     print(
         f"pipeline     : prefetch={settings.tts_prefetch} "
-        f"trim_edge={settings.tts_trim_edge_ms}ms "
+        f"trim_trailing={settings.tts_trim_trailing_ms}ms "
         f"gap={settings.tts_sentence_gap_ms}ms "
         f"decode_interval={settings.tts_decode_interval_bytes}B\n"
     )

@@ -295,7 +295,7 @@ class SpeakerService:
     def _on_tts_error(self, data: dict) -> None:
         """Handle a per-sentence TTS synthesis error."""
         stage = data.get("stage", "tts")
-        message = data.get("message", "unknown error")
+        message = data.get("error", data.get("message", "unknown error"))
         sentence_index = data.get("sentence_index", -1)
         fatal = data.get("fatal", False)
         log.error(

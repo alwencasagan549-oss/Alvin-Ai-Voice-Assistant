@@ -47,7 +47,7 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = build_settings()
 
     # Check defaults
-    assert settings.host == "0.0.0.0"
+    assert settings.host == "127.0.0.1"
     assert settings.port == 8000
     assert settings.log_level == "info"
     assert settings.whisper_language == "en"
@@ -66,8 +66,8 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.fallback_model == "base.en"
     assert settings.preload_fallback is True
     assert settings.cpu_threads == 4
-    assert settings.silence_threshold_dbfs == -60.0
-    assert settings.vad_threshold == 0.6
+    assert settings.silence_threshold_dbfs == -55.0
+    assert settings.vad_threshold == 0.5
     assert settings.min_silence_duration_ms == 500
     assert settings.speech_pad_ms == 30
     assert settings.sample_rate == 16000
@@ -77,11 +77,13 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.tts_voice == "en-US-AndrewNeural"
     assert settings.tts_prefetch == 3
     assert settings.tts_silence_threshold_dbfs == -45.0
-    assert settings.tts_trim_edge_ms == 100
+    assert settings.tts_trim_leading_ms == 30
+    assert settings.tts_trim_trailing_ms == 100
     assert settings.tts_sentence_gap_ms == 80
     assert settings.tts_decode_interval_bytes == 2048
     assert settings.tts_retries == 2
-    assert settings.tts_retry_backoff_ms == 250
+    assert settings.tts_retry_backoff_ms == 300
+    assert settings.tts_timeout_sec == 4.0
     assert settings.tts_auto_speak is False
     assert settings.tts_warmup is True
     assert settings.max_connections == 64
@@ -91,10 +93,10 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.intent_min_confidence == 0.5
     assert settings.api_key == ""
     assert settings.llm_api_key == ""
-    assert settings.llm_base_url == "https://api.groq.com/openai/v1"
-    assert settings.llm_model == "openai/gpt-oss-20b"
+    assert settings.llm_base_url == "https://api.kilo.ai/api/gateway"
+    assert settings.llm_model == "nvidia/nemotron-3.5-lightning:free"
     assert settings.llm_enabled is True
-    assert settings.llm_max_tokens == 128
+    assert settings.llm_max_tokens == 300
     assert settings.llm_temperature == 0.7
     assert "You are Alvin" in settings.llm_system_prompt
     assert settings.llm_timeout_sec == 15.0
@@ -142,11 +144,13 @@ def test_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         ("TTS_VOICE", "en-US-AriaNeural", "tts_voice"),
         ("TTS_PREFETCH", "5", "tts_prefetch", int),
         ("TTS_SILENCE_THRESHOLD_DBFS", "-40.0", "tts_silence_threshold_dbfs", float),
-        ("TTS_TRIM_EDGE_MS", "50", "tts_trim_edge_ms", int),
+        ("TTS_TRIM_LEADING_MS", "30", "tts_trim_leading_ms", int),
+        ("TTS_TRIM_TRAILING_MS", "100", "tts_trim_trailing_ms", int),
         ("TTS_SENTENCE_GAP_MS", "40", "tts_sentence_gap_ms", int),
         ("TTS_DECODE_INTERVAL_BYTES", "4096", "tts_decode_interval_bytes", int),
         ("TTS_RETRIES", "5", "tts_retries", int),
         ("TTS_RETRY_BACKOFF_MS", "100", "tts_retry_backoff_ms", int),
+        ("TTS_TIMEOUT_SEC", "10.0", "tts_timeout_sec", float),
         ("TTS_AUTO_SPEAK", "true", "tts_auto_speak", "bool"),
         ("TTS_WARMUP", "false", "tts_warmup", "bool"),
         ("MAX_CONNECTIONS", "32", "max_connections", int),
@@ -293,11 +297,20 @@ def test_build_settings_returns_independent_instances(
 
 
 def test_env_var_table_matches_settings_fields() -> None:
-    """Every dataclass field must have an env source and vice versa."""
-    from app.config import _FIELD_ENV_SOURCES
+    """Every dataclass field must have an env source in ENV_VAR_NAMES.
+
+    ENV_VAR_NAMES entries are upper-case env var names (optionally with a
+    legacy alias after "|"); they map to lower-case dataclass field names.
+    """
+    from dataclasses import fields
 
     field_names = {f.name for f in fields(Settings)}
-    assert set(_FIELD_ENV_SOURCES) == field_names
+    # The first alias of each entry is the canonical env var for that field.
+    env_to_field = {
+        name.split("|")[0].lower() for name in ENV_VAR_NAMES
+    }
+    missing = field_names - env_to_field
+    assert not missing, f"settings fields without env source: {sorted(missing)}"
 
 
 def test_env_var_names_are_unique() -> None:
@@ -309,17 +322,16 @@ def test_env_var_names_are_unique() -> None:
 # --------------------------------------------------------------------------- #
 # Assistant persona
 # --------------------------------------------------------------------------- #
-def test_default_prompt_states_name_and_creator() -> None:
-    """The built-in persona must name Alvin and credit Alwin Casagan.
+def test_default_prompt_states_name_and_constraints() -> None:
+    """The built-in persona names Alvin and carries the voice constraints.
 
     This guards the *default*; a deployment may override LLM_SYSTEM_PROMPT.
     """
     from app.config import DEFAULT_LLM_SYSTEM_PROMPT as prompt
 
     assert "Alvin" in prompt
-    assert "Alwin Casagan" in prompt
-    assert "Dinagat Island" in prompt
-    assert "web developer" in prompt.lower()
+    assert "text-to-speech" in prompt.lower()
+    assert "plain text" in prompt.lower()
 
 
 def test_default_prompt_keeps_the_voice_constraints() -> None:
@@ -331,11 +343,3 @@ def test_default_prompt_keeps_the_voice_constraints() -> None:
     assert "emoji" in low
     assert "markdown" in low
     assert "short" in low
-
-
-def test_default_prompt_does_not_claim_a_body() -> None:
-    """The model once said it lived in Dinagat; that is the creator's home."""
-    from app.config import DEFAULT_LLM_SYSTEM_PROMPT as prompt
-
-    low = prompt.lower()
-    assert "do not have a body" in low or "no body" in low

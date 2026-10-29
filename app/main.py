@@ -14,7 +14,7 @@ WebSocket output events:
 
 Run with::
 
-    uvicorn app.main:app --host 0.0.0.0 --port 8000
+    uvicorn app.main:app --host 127.0.0.1 --port 8000
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from .config import settings
 from .connection import Connection, manager, verify_token
 from .llm import llm_service
 from .intents import SUPPORTED_INTENTS
+from .speaker import get_speaker_service, shutdown_speaker_service
 from .stt import stt_service
 from .tts import warm_up as tts_warm_up
 from .vad import VADStreamDetector
@@ -103,6 +104,15 @@ async def lifespan(app: FastAPI):
         )
     else:
         log.info("LLM brain disabled (set LLM_API_KEY to enable)")
+
+    # Initialize speaker service if enabled
+    if settings.speaker_enabled:
+        try:
+            await get_speaker_service()
+            log.info("Speaker identification service initialized")
+        except Exception as exc:
+            log.warning("Speaker identification service failed to initialize: %s", exc)
+
     yield
     for task in warmup_tasks:
         if not task.done():
@@ -111,6 +121,7 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(*warmup_tasks, return_exceptions=True)
     await stt_service.shutdown()
     await llm_service.shutdown()
+    await shutdown_speaker_service()
 
 
 app = FastAPI(
@@ -120,8 +131,23 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Allow the Vite dev server (and any other frontend origin) to reach the
+# backend API and WebSocket endpoints when running on a different port.
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,   # was True; * + credentials is invalid
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# For production, replace allow_origins=["*"] with:
+# allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+
 
 @app.get("/health")
+@app.get("/api/health")
 async def health() -> JSONResponse:
     """Report the models that actually serve requests.
 
@@ -141,6 +167,8 @@ async def health() -> JSONResponse:
             "ready": ready,
             "language": settings.language,
             "tts_voice": settings.tts_voice,
+            "sample_rate": settings.sample_rate,
+            "max_llm_history": settings.max_llm_history,
             "auth_required": settings.auth_required,
             "active_connections": manager.active_count,
             "max_connections": settings.max_connections,
@@ -171,6 +199,11 @@ async def health() -> JSONResponse:
                 "max_frame_size": settings.max_frame_size,
                 "push_to_talk": settings.push_to_talk,
                 "push_to_talk_timeout_ms": settings.push_to_talk_timeout_ms,
+            },
+            "speaker": {
+                "enabled": settings.speaker_enabled,
+                "min_identify_sec": settings.speaker_min_identify_sec,
+                "max_identify_sec": settings.speaker_max_identify_sec,
             },
         }
     )

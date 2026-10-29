@@ -32,6 +32,68 @@ from .config import settings
 
 log = logging.getLogger("alvin.stt")
 
+# Phrases Whisper reliably emits when fed near-silence. Matching them **only
+# below the silence threshold + a small margin** keeps real speech ("yes",
+# "thank you" said to the assistant) from being dropped.
+_COMMON_HALLUCINATIONS: frozenset[str] = frozenset({
+    "you", "yeah", "bye", "okay", "ok", "yes", "no",
+    "thank you", "thanks", "thank you for watching",
+    "thanks for watching", "please subscribe",
+    "subscribe", "like and subscribe",
+    "subtitles by", "subtitles", "amara.org",
+    "transcription by", "captions by",
+    "the end", "...",
+})
+
+# Extend into matched sub-phrases so "thank you very much" also matches.
+_HALLUCINATION_PREFIXES = (
+    "thank you", "thanks", "please subscribe", "subtitles by",
+    "amara.org", "transcription by", "captions by", "transcribed by",
+)
+
+# How far above SILENCE_THRESHOLD_DBFS a segment must be before its transcript
+# is trusted unconditionally. Below this margin (but above the silence gate),
+# only non-hallucination transcripts are accepted.
+_HALLUCINATION_GUARD_MARGIN_DB = 6.0
+
+
+def _looks_like_hallucination(text: str) -> bool:
+    """True when a transcript matches a known Whisper silence artifact."""
+    cleaned = text.strip().strip(".!?,;:").lower()
+    if not cleaned:
+        return True  # empty / punctuation-only
+    if cleaned in _COMMON_HALLUCINATIONS:
+        return True
+    for prefix in _HALLUCINATION_PREFIXES:
+        if cleaned.startswith(prefix):
+            return True
+    return False
+
+
+def _filter_hallucination(
+    text: str, confidence: float, level_dbfs: float
+) -> tuple[str, float, bool]:
+    """Return ``(text, confidence, filtered)`` for a transcribed segment.
+
+    If the audio is quiet (close to the silence gate) and the transcript
+    matches a known Whisper silence artifact, return empty text. A loud
+    segment saying "thank you" is *not* filtered — that's real speech.
+    """
+    if not text.strip():
+        return "", confidence, True
+    if level_dbfs >= settings.silence_threshold_dbfs + _HALLUCINATION_GUARD_MARGIN_DB:
+        # Clearly not near-silence — trust the transcript.
+        return text, confidence, False
+    if _looks_like_hallucination(text):
+        log.debug(
+            "hallucination filter: dropped %r (%.1f dBFS, conf=%.2f)",
+            text[:60],
+            level_dbfs,
+            confidence,
+        )
+        return "", 0.0, True
+    return text, confidence, False
+
 
 def audio_dbfs(audio: np.ndarray) -> float:
     """Full-scale RMS level of a float32 signal in dBFS.
@@ -277,6 +339,14 @@ class LocalWhisperBackend:
             beam_size=1,
             condition_on_previous_text=False,
             vad_filter=False,
+            # These are faster-whisper defaults but making them explicit
+            # matters: without no_speech_threshold, the model still emits text
+            # for audio it believes is non-speech. With it set, near-silent
+            # segments come back empty instead of "Thank you.".
+            no_speech_threshold=0.6,
+            log_prob_threshold=-1.0,
+            compression_ratio_threshold=2.4,
+            temperature=0.0,
         )
         text = normalize_spoken_text(" ".join(seg.text for seg in segments).strip())
         confidence = getattr(info, "transcription_probability", 0.8)
@@ -350,6 +420,20 @@ class STTService:
         self._local_backend = None
         self._groq_backend = None
 
+    async def transcribe_local_async(
+        self, audio: np.ndarray, language: str | None
+    ) -> tuple[str, float]:
+        """Transcribe with the local model only (muted-mode keyword pass).
+
+        Bypasses Groq entirely so a muted connection can still decode "unmute"
+        without paying for a cloud turn. Returns ``(text, confidence)``.
+        """
+        backend = self._get_local_backend()
+        if backend.model is None:
+            await backend.ensure_loaded()
+        result = await backend.transcribe_async(audio, language)
+        return result.text, result.confidence
+
     async def transcribe_async(
         self, audio: np.ndarray, language: str | None
     ) -> tuple[str, float]:
@@ -410,14 +494,30 @@ class STTService:
             result = await local_backend.transcribe_async(audio, language)
             log.info("Local transcription succeeded")
 
+        # Hallucination filter: only active for segments close to the silence
+        # gate. Loud segments are trusted as-is, so "thank you" said to the
+        # assistant still works.
+        text, confidence, filtered = _filter_hallucination(
+            result.text, result.confidence, level_dbfs
+        )
+        if filtered and not text:
+            log.debug(
+                "STT [%s] filtered hallucination (%.1f dBFS): %r",
+                result.model,
+                level_dbfs,
+                result.text[:60],
+            )
+            return "", 0.0
+
         log.debug(
-            "STT [%s] latency=%.1fms confidence=%.3f text=%r",
+            "STT [%s] latency=%.1fms confidence=%.3f level=%.1f dBFS text=%r",
             result.model,
             result.latency_ms,
-            result.confidence,
-            result.text[:50],
+            confidence,
+            level_dbfs,
+            text[:50],
         )
-        return result.text, result.confidence
+        return text, confidence
 
 
 stt_service = STTService()

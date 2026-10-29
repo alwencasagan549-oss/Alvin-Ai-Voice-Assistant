@@ -129,18 +129,18 @@ def _setup_console_hotkey(ptt_state_queue: queue.Queue[bool], flush_callback) ->
         return
 
     def _console_listener():
-        print("Idle (press Enter to enable mic, Enter again to stop)", flush=True)
+        print("Idle (press Enter to enable mic, Enter again to barge-in)", flush=True)
         while True:
             line = sys.stdin.readline()
             if not line:
                 break
             if line == "\n":
                 flush_callback()
-                ptt_state_queue.put_nowait(True)
+                ptt_state_queue.put_nowait(True)  # Simple: always enable when hotkey is pressed
 
     thread = threading.Thread(target=_console_listener, daemon=True)
     thread.start()
-    print("Console fallback active: press Enter to enable mic / stop TTS", flush=True)
+    print("Console fallback active: press Enter to enable mic / barge-in during TTS", flush=True)
 
 
 def _build_uri(uri: str, token: str | None) -> str:
@@ -202,6 +202,7 @@ async def stream_mic(
             fut.result(timeout=2)
         except Exception as exc:
             print(f"[ptt] flush failed: {exc}", file=sys.stderr, flush=True)
+        # Simple: always enable PTT when the hotkey is pressed
         ptt_state_queue.put_nowait(True)
 
     # Set up PTT hotkey with fallback
@@ -303,7 +304,6 @@ async def stream_mic(
                 if playback_task is None or playback_task.done():
                     playback_task = asyncio.create_task(play_tts_audio())
                     tts_playing = True
-                    ptt_enabled = False
                     speech_onset_count = 0
                 await audio_queue.put(msg)
             else:

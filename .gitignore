@@ -6,6 +6,11 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.pip-cache/
+%TEMP%/
+.claude/
+.kilo/
+.vscode/
 
 # --------------------------------------------------------------------------- #
 # Test / lint caches
@@ -35,4 +40,9 @@ scripts/measure_turn_latency.py
 nv_*.py
 nv_*.json
 test model*.png
-4}
+
+# PID ownership record used by start-all.ps1 -Stop
+.alvin-servers.json
+
+# Local speaker identification profiles contain serialized voice embeddings.
+speaker_profiles.pkl

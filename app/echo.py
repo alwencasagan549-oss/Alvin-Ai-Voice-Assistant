@@ -214,8 +214,10 @@ class EchoGuard:
 
         ``False`` during playback in ``gate`` mode and during the cooldown. In
         ``filter`` mode playback is allowed through (so barge-in works) and only
-        the cooldown applies.
+        the cooldown applies. ``off`` accepts audio unconditionally.
         """
+        if settings.echo_mode == "off":
+            return True
         if time.monotonic() < self._cooldown_until:
             return False
         return not (self._speaking and settings.echo_mode == "gate")
@@ -233,7 +235,7 @@ class EchoGuard:
     def recent_speech(self) -> list[str]:
         """Spoken sentences still inside ``ECHO_HISTORY_SEC``."""
         cutoff = time.monotonic() - settings.echo_history_sec
-        return [t for ts, t in self._spoken if ts >= cutoff]
+        return [t for ts, t in self._spoken if ts > cutoff]
 
     def is_echo(self, text: str) -> bool:
         """True when ``text`` is (probably) the assistant hearing itself."""

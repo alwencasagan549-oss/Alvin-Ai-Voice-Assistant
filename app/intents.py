@@ -237,6 +237,39 @@ _QUERY_TIME_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ── YouTube playback ─────────────────────────────────────────────────────
+# "play {song} on youtube" / "play {song} on yt"
+_PLAY_ON_YOUTUBE_RE = re.compile(
+    r"^(?:play|open)\s+(?P<query>.+?)\s+on\s+(?:youtube|yt)$",
+    re.IGNORECASE,
+)
+# "play youtube {song}" / "open youtube and play {song}" / "search youtube for {song}"
+_YOUTUBE_SEARCH_RE = re.compile(
+    r"^(?:play|open|search)\s+(?:on\s+)?youtube"
+    r"\s+(?:for\s+|and\s+play\s+)?(?P<query>.+)$",
+    re.IGNORECASE,
+)
+# "youtube {song}"
+_YOUTUBE_BARE_RE = re.compile(r"^youtube\s+(?P<query>.+)$", re.IGNORECASE)
+# "play the song {song}" / "play song {song}" / "play track {song}"
+_PLAY_SONG_QUALIFIED_RE = re.compile(
+    r"^play\s+(?:the\s+)?(?:song|track|music\s+video|video)"
+    r"\s+(?:called\s+|named\s+)?(?P<query>.+)$",
+    re.IGNORECASE,
+)
+# Bare "play {song}" — aggressive fallback; denied-list rejects filler queries.
+_PLAY_ANY_SONG_RE = re.compile(r"^play\s+(?P<query>.+)$", re.IGNORECASE)
+
+# Queries that are playback controls, not a specific song. These are rejected
+# for the bare "play X" pattern so "play music" / "play a song" stay generic.
+_PLAY_GENERIC_QUERIES: frozenset[str] = frozenset({
+    "it", "that", "this", "something", "anything", "nice", "again",
+    "music", "the music", "some music", "a song", "the song", "song",
+    "the track", "track", "the audio", "audio", "the sound", "sound",
+    "the video", "video", "the game", "game", "a game", "with me", "dead",
+    "loud", "louder", "more",
+})
+
 
 @dataclass(frozen=True)
 class _Command:
@@ -280,6 +313,12 @@ _COMMANDS: tuple[_Command, ...] = (
     _Command("next", _NEXT_RE, "Next."),
     _Command("previous", _PREVIOUS_RE, "Previous."),
     _Command("play", _PLAY_RE, "Playing."),
+    # YouTube — most specific first
+    _Command("play_youtube", _PLAY_ON_YOUTUBE_RE,     "Playing on YouTube."),
+    _Command("play_youtube", _YOUTUBE_SEARCH_RE,      "Playing on YouTube."),
+    _Command("play_youtube", _YOUTUBE_BARE_RE,        "Playing on YouTube."),
+    _Command("play_youtube", _PLAY_SONG_QUALIFIED_RE, "Playing on YouTube."),
+    _Command("play_youtube", _PLAY_ANY_SONG_RE,       "Playing on YouTube."),
     _Command("query_time", _QUERY_TIME_RE),
 )
 
@@ -491,6 +530,13 @@ def route_command(
         slots: dict[str, Any] = {
             name: value for name, value in match.groupdict().items() if value
         }
+        # Bare "play X" is only a YouTube search if X looks like a song title.
+        # "play music" / "play a song" / "play something" fall through to the
+        # generic `play` intent above or the LLM.
+        if command.intent == "play_youtube" and "query" in slots:
+            q = str(slots["query"]).strip().lower()
+            if len(q) < 2 or q in _PLAY_GENERIC_QUERIES:
+                continue
         # Named levels ("set volume to max") resolve to a number here so
         # downstream consumers only ever see an int.
         if "level" in slots:

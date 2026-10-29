@@ -84,6 +84,17 @@ async def test_health_endpoint_returns_ok(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 @pytest.mark.asyncio
+async def test_health_does_not_publish_speaker_similarity_threshold() -> None:
+    from app.main import app
+
+    client = TestClient(app)
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert "similarity_threshold" not in response.json()["speaker"]
+
+
+@pytest.mark.asyncio
 async def test_health_endpoint_shows_starting_when_not_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

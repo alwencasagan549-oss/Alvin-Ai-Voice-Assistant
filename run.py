@@ -69,8 +69,8 @@ def main() -> None:
     parser.add_argument(
         "--vad-threshold",
         type=float,
-        default=0.5,
-        help="Silero VAD threshold (default: 0.5; raise to reduce false positives)",
+        default=None,
+        help="Silero VAD threshold (defaults to VAD_THRESHOLD, then 0.5)",
     )
     parser.add_argument(
         "--vad-frames",
@@ -86,10 +86,30 @@ def main() -> None:
         help="PTT hotkey mode: 'global' (Shift+Z, requires admin), 'console' (Enter key, no admin)",
     )
     args = parser.parse_args()
+    if (
+        not args.mic
+        and settings.host not in {"127.0.0.1", "localhost", "::1"}
+        and not settings.api_key
+    ):
+        parser.error("HOST must be loopback unless API_KEY is configured")
+    vad_threshold = (
+        args.vad_threshold
+        if args.vad_threshold is not None
+        else settings.vad_threshold
+    )
 
     if args.mic:
         port = args.port or _free_port()
         os.environ.setdefault("TTS_AUTO_SPEAK", "true")
+        # Propagate CLI args to the spawned server as environment variables
+        if args.vad_threshold is not None:
+            os.environ["VAD_THRESHOLD"] = str(vad_threshold)
+        if args.voice:
+            os.environ["TTS_VOICE"] = args.voice
+        if args.language:
+            os.environ["WHISPER_LANGUAGE"] = args.language
+        if args.token:
+            os.environ["API_KEY"] = args.token
         print(f"Starting Alvin server on port {port}...", flush=True)
         proc = subprocess.Popen(
             [
@@ -148,7 +168,7 @@ def main() -> None:
                     args.token,
                     args.language,
                     args.voice,
-                    args.vad_threshold,
+                    vad_threshold,
                     args.vad_frames,
                     args.ptt_mode,
                 )

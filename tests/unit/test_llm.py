@@ -115,6 +115,18 @@ def test_build_messages_pins_the_system_prompt():
     assert messages[-1] == {"role": "user", "content": "hello"}
 
 
+def test_build_messages_replaces_existing_system_prompt_without_mutating_history():
+    history = [
+        {"role": "system", "content": "old"},
+        {"role": "user", "content": "previous turn"},
+    ]
+
+    messages = build_messages(history, "hi", system_prompt="new")
+
+    assert messages[0] == {"role": "system", "content": "new"}
+    assert history[0] == {"role": "system", "content": "old"}
+
+
 def test_build_messages_trims_to_cap_keeping_system():
     history = [{"role": "system", "content": "sys"}]
     history += [{"role": "user", "content": str(i)} for i in range(30)]

@@ -284,12 +284,15 @@ def test_warm_up_never_raises_on_transport_failure(monkeypatch):
     assert asyncio.run(warm_up()) is False
 
 
-def test_warmup_text_is_a_single_short_sentence():
+def test_warmup_text_exercises_multi_sentence_pipeline():
+    # WARMUP_TEXT is intentionally multi-sentence so warm-up exercises the
+    # sentence-splitting, gap-silence, and prefetch machinery -- not just the
+    # TLS handshake. See the comment in app/tts.py next to WARMUP_TEXT.
     from app.tts import WARMUP_TEXT, chunk_sentences, clean_text_for_tts
 
     sentences = chunk_sentences(clean_text_for_tts(WARMUP_TEXT))
-    assert len(sentences) == 1
-    assert len(WARMUP_TEXT) <= 16
+    assert len(sentences) >= 2  # exercises the multi-sentence path
+    assert all(s for s in sentences)  # no empty chunks after cleaning
 
 
 def _run_fetch(fake_comm, retries=2, backoff_ms=1):

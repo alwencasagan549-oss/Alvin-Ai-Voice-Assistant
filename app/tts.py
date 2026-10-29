@@ -21,9 +21,9 @@ Latency notes (measured with ``scripts/bench_tts.py``):
   roughly the burst window (~0.1-0.3 s) rather than the whole synthesis.
 * Prefetching the next sentences concurrently hides most of the network wait
   for sentences 2..N, which is where the multi-second win comes from.
-* The trimmer holds back ``TTS_TRIM_EDGE_MS`` of audio to be able to drop
-  end-of-sentence silence; set it to 0 for minimum time-to-first-audio at the
-  cost of keeping the trailing silence.
+* The trimmer holds back ``TTS_TRIM_TRAILING_MS`` of audio to be able to drop
+  end-of-sentence silence; set it to 0 for minimum time-to-first-audio at
+  the cost of keeping the trailing silence.
 """
 
 from __future__ import annotations
@@ -31,17 +31,46 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import time
 from collections.abc import AsyncGenerator
 from typing import TypedDict
 
 import edge_tts
+import edge_tts.communicate as _edge_communicate
+import edge_tts.constants as _edge_constants
 import miniaudio
 import numpy as np
 
 from .config import settings
 
 log = logging.getLogger("alvin.tts")
+
+# ── Patch edge-tts for the new October 2026 endpoint ──────────────────────
+# Microsoft retired the old speech.platform.bing.com host (returns 403).
+# The new service lives at api.msedgeservices.com and authenticates with
+# Ocp-Apim-Subscription-Key instead of TrustedClientToken.  We monkey-patch
+# the constants that edge-tts read at import time so no library code changes
+# are needed.
+_LEGACY_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
+_edge_constants.BASE_URL = "api.msedgeservices.com/tts/cognitiveservices"
+_edge_constants.WSS_URL = (
+    f"wss://{_edge_constants.BASE_URL}/websocket/v1"
+    f"?Ocp-Apim-Subscription-Key={_LEGACY_TOKEN}"
+)
+_edge_constants.VOICE_LIST = (
+    f"https://{_edge_constants.BASE_URL}/voices/list"
+    f"?Ocp-Apim-Subscription-Key={_LEGACY_TOKEN}"
+)
+_edge_constants.TRUSTED_CLIENT_TOKEN = _LEGACY_TOKEN
+_edge_communicate.WSS_URL = _edge_constants.WSS_URL
+# drm.py also imported TRUSTED_CLIENT_TOKEN at module load
+import edge_tts.drm as _edge_drm
+_edge_drm.TRUSTED_CLIENT_TOKEN = _LEGACY_TOKEN
+# Update VOICE_HEADERS Authority to match new endpoint
+_edge_constants.VOICE_HEADERS["Authority"] = _edge_constants.BASE_URL.split("/")[0]
+# voices.py imports VOICE_LIST from constants at module load, patch it too
+import edge_tts.voices as _edge_voices
+_edge_voices.VOICE_LIST = _edge_constants.VOICE_LIST
+log.debug("Patched edge-tts for new endpoint: %s", _edge_constants.WSS_URL[:60])
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+|\n+")
 _MARKDOWN_BOLD = re.compile(r"\*\*(.+?)\*\*")
@@ -59,9 +88,10 @@ TARGET_SAMPLE_RATE = 16000
 TARGET_SAMPLE_WIDTH = 2
 TARGET_CHANNELS = 1
 
-# Shortest phrase worth synthesizing: one word keeps the warm-up cheap while
-# still exercising the edge-tts connection and the progressive MP3 decode.
-WARMUP_TEXT = "Ready."
+# Warm-up phrase: longer than a single word so it exercises the sentence-splitting
+# code path, gap-silence injection, and the multi-sentence prefetch machinery —
+# not just the TLS handshake.
+WARMUP_TEXT = "Ready to help. Ask me anything."
 
 _PCM_DTYPE = np.dtype("<i2")
 
@@ -74,7 +104,7 @@ class TTSErrorEvent(TypedDict):
 
     type: str
     stage: str
-    message: str
+    error: str
     sentence_index: int
     sentence: str
     fatal: bool
@@ -84,7 +114,7 @@ class TTSSynthesisError(RuntimeError):
     """Raised by :func:`synthesize_pcm` when the stream reports a failure."""
 
     def __init__(self, event: TTSErrorEvent) -> None:
-        super().__init__(event["message"])
+        super().__init__(event.get("error", event.get("message", "TTS synthesis failed")))
         self.event = event
 
 
@@ -132,13 +162,15 @@ class EdgeSilenceTrimmer:
     """Incrementally drops leading/trailing silence below a threshold.
 
     Leading silence is suppressed until the first frame exceeds the threshold.
-    Trailing silence is held back by ``hold`` frames and only emitted if it
-    contains speech; otherwise it is dropped.
+    Trailing silence is held back by ``trailing_hold`` frames and only emitted if it
+    contains speech; otherwise it is dropped. Leading hold is separate and used
+    only to preserve speech onset during leading silence detection.
     """
 
-    def __init__(self, threshold: int, hold: int) -> None:
+    def __init__(self, threshold: int, leading_hold: int, trailing_hold: int) -> None:
         self._threshold = threshold
-        self._hold = max(0, hold)
+        self._leading_hold = max(0, leading_hold)
+        self._trailing_hold = max(0, trailing_hold)
         self._pending = np.empty(0, dtype=_PCM_DTYPE)
         self._speech_started = False
 
@@ -157,10 +189,10 @@ class EdgeSilenceTrimmer:
         if not self._speech_started:
             loud = np.flatnonzero(np.abs(frames) >= self._threshold)
             if loud.size == 0:
-                # Keep only the most recent hold frames so the onset survives.
+                # Keep only the most recent leading_hold frames so the onset survives.
                 self._pending = (
-                    frames[-self._hold :]
-                    if self._hold
+                    frames[-self._leading_hold :]
+                    if self._leading_hold
                     else np.empty(0, dtype=_PCM_DTYPE)
                 )
                 return b""
@@ -168,13 +200,14 @@ class EdgeSilenceTrimmer:
             self._pending = np.empty(0, dtype=_PCM_DTYPE)
             return frames[int(loud[0]) :].tobytes()
 
-        if self._hold == 0:
+        # Speech has started - use trailing_hold for end-of-sentence buffering
+        if self._trailing_hold == 0:
             return frames.tobytes()
-        if frames.size <= self._hold:
+        if frames.size <= self._trailing_hold:
             self._pending = frames
             return b""
-        self._pending = frames[-self._hold :]
-        return frames[: -self._hold].tobytes()
+        self._pending = frames[-self._trailing_hold :]
+        return frames[: -self._trailing_hold].tobytes()
 
     def flush(self) -> bytes:
         """End of sentence: emit the held tail unless it is pure silence."""
@@ -196,17 +229,34 @@ class _PcmAssembler:
     the buffer and emitting only the new tail is artifact-free.
     """
 
-    def __init__(self, threshold: int, hold: int, interval_bytes: int) -> None:
+    def __init__(
+        self,
+        threshold: int,
+        leading_hold: int,
+        trailing_hold: int,
+        interval_bytes: int,
+    ) -> None:
         self._buffer = bytearray()
         self._decoded_bytes = 0
         self._emitted_samples = 0
         self._interval = max(1, interval_bytes)
-        self._trimmer = EdgeSilenceTrimmer(threshold, hold)
+        # Leading hold is cheap (just delays first audio); trailing hold needs
+        # to be larger to detect real end-of-sentence silence.
+        self._trimmer = EdgeSilenceTrimmer(threshold, leading_hold, trailing_hold)
 
     async def push(self, mp3_chunk: bytes) -> bytes:
         """Add MP3 bytes, returning any newly available trimmed PCM."""
         self._buffer.extend(mp3_chunk)
-        if len(self._buffer) - self._decoded_bytes < self._interval:
+        new_bytes = len(self._buffer) - self._decoded_bytes
+        # Decode schedule: first decode at 512 bytes, subsequent decodes at the
+        # configured interval (not 2x). The 2x was an optimization that made
+        # behavior harder to reason about and could starve the first decode
+        # if it emitted no samples. Using the interval consistently is clearer.
+        if self._emitted_samples == 0:
+            interval = 512
+        else:
+            interval = self._interval
+        if new_bytes < interval:
             return b""
         return await self._drain()
 
@@ -232,6 +282,13 @@ async def _fetch_sentence_mp3(
     sentence: str,
     voice: str,
     queue: asyncio.Queue,
+    # Optional override of the production ``TTS_RETRIES`` / ``TTS_RETRY_BACKOFF_MS``
+    # settings. Kept as a deliberate test hook: the unit tests in
+    # ``tests/unit/test_tts.py`` pass ``backoff_ms=1`` (production default is 150 ms)
+    # so the retry-interaction path is exercised in milliseconds instead of seconds.
+    # ``retries`` is left at the production default (2 → 3 total attempts) so the
+    # tested retry count matches production behavior. No production call site passes
+    # either parameter; both resolve to the settings values below.
     retries: int | None = None,
     backoff_ms: int | None = None,
 ) -> None:
@@ -303,7 +360,7 @@ def _error_event(exc: BaseException, index: int, sentence: str) -> TTSErrorEvent
     return TTSErrorEvent(
         type="error",
         stage="tts",
-        message=f"{type(exc).__name__}: {exc}",
+        error=f"{type(exc).__name__}: {exc}",
         sentence_index=index,
         sentence=sentence[:120],
         fatal=False,
@@ -324,7 +381,8 @@ async def synthesize_sentence_stream(
 
     assembler = _PcmAssembler(
         threshold=dbfs_to_amplitude(settings.tts_silence_threshold_dbfs),
-        hold=int(settings.tts_trim_edge_ms * TARGET_SAMPLE_RATE / 1000),
+        leading_hold=int(settings.tts_trim_leading_ms * TARGET_SAMPLE_RATE / 1000),
+        trailing_hold=int(settings.tts_trim_trailing_ms * TARGET_SAMPLE_RATE / 1000),
         interval_bytes=settings.tts_decode_interval_bytes,
     )
     queue: asyncio.Queue = asyncio.Queue()
@@ -373,7 +431,8 @@ async def synthesize_stream(
     voice = voice or settings.tts_voice
     window = max(1, prefetch if prefetch is not None else settings.tts_prefetch)
     threshold = dbfs_to_amplitude(settings.tts_silence_threshold_dbfs)
-    hold = int(settings.tts_trim_edge_ms * TARGET_SAMPLE_RATE / 1000)
+    leading_hold = int(settings.tts_trim_leading_ms * TARGET_SAMPLE_RATE / 1000)
+    trailing_hold = int(settings.tts_trim_trailing_ms * TARGET_SAMPLE_RATE / 1000)
     gap = silence_gap_bytes(settings.tts_sentence_gap_ms)
 
     queues: list[asyncio.Queue] = [asyncio.Queue() for _ in sentences]
@@ -391,13 +450,16 @@ async def synthesize_stream(
 
     try:
         for index in range(len(sentences)):
-            # Wait for the next producer to finish (or fail).
-            if index in producers:
-                await producers[index]
-            # Drain this sentence's queue.
+            # Ensure the producer for this sentence has been started.
+            spawn(index)
+            # Drain this sentence's queue progressively as MP3 chunks arrive
+            # from the producer — do NOT await the producer task first, because
+            # that would block until the entire sentence is fetched, defeating
+            # the progressive-decode pipeline.
             assembler = _PcmAssembler(
                 threshold=threshold,
-                hold=hold,
+                leading_hold=leading_hold,
+                trailing_hold=trailing_hold,
                 interval_bytes=settings.tts_decode_interval_bytes,
             )
             q = queues[index]
@@ -470,7 +532,7 @@ async def warm_up(voice: str | None = None) -> bool:
         async for chunk in synthesize_stream(WARMUP_TEXT, voice or settings.tts_voice):
             # Check for error events from synthesize_stream
             if isinstance(chunk, dict) and chunk.get("type") == "error":
-                log.warning("TTS warm-up error event: %s", chunk.get("message"))
+                log.warning("TTS warm-up error event: %s", chunk.get("error"))
                 return False
         log.info("TTS warm-up completed")
         return True

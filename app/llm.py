@@ -37,6 +37,7 @@ import json
 import logging
 import re
 import time
+import types
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import date
@@ -61,6 +62,12 @@ def build_system_prompt() -> str:
         f"Today's date: {today}.\n"
         "Your replies are spoken aloud. Answer in 1 to 3 short sentences. "
         "No markdown, no URLs — say source names instead of links. "
+        "When you need current information, use the web_search tool. "
+        "Never narrate tool use — do NOT say 'let me search', 'I'll look that up', "
+        "'I'm going to check', 'searching now', or anything similar. Either answer "
+        "directly or emit the tool call silently. Your output is fed directly to a "
+        "text-to-speech engine, so any narration will be spoken aloud and is strictly "
+        "forbidden.\n"
         "Search for current things (news, weather, scores, prices, rankings, "
         "'latest', 'today', 'right now'). Use topic=\"news\" for anything time-sensitive; "
         "use topic=\"general\" for stable knowledge. "
@@ -117,6 +124,263 @@ def _check_voice_override(text: str) -> int | None:
             return 0
     return None
 
+
+# ── narration filter + text-tool-call parser ────────────────────────────────
+
+_NARRATION_LEAD_RE = re.compile(
+    r"^(?:(?:i'?m going to|i'?ll|i will|i'?m|i need to|let me|searching|looking|"
+    r"i'?ll use the topic|i'?m gonna)\b[^.!?]*[.!?]\s*)+",
+    re.IGNORECASE,
+)
+
+
+def _filter_narration(sentence: str) -> str:
+    """Strip 'let me search' / 'I'll look that up' preambles.
+
+    These phrases are directed at an imaginary user; because the assistant's
+    output is spoken aloud, saying 'let me search' is both annoying and
+    misleading — the search happens silently regardless.
+
+    Returns "" when the whole sentence was narration.
+    """
+    if not sentence:
+        return ""
+    return _NARRATION_LEAD_RE.sub("", sentence).strip()
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split buffered text into sentences for narration filtering."""
+    if not text.strip():
+        return []
+    parts = _SENTENCE_END.split(text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _find_json_object(text: str, start: int) -> str | None:
+    """Find the balanced JSON object starting at or after ``start``."""
+    obj_start = text.find("{", start)
+    if obj_start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(obj_start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[obj_start : i + 1]
+    return None
+
+
+def _extract_text_tool_call(content: str):
+    """Detect a web_search call written as plain text.
+
+    Cloudflare's llama-3.2-3b sometimes writes the tool call as text:
+        web_search {"name": "web_search", "parameters": {"query": "...", "topic": "..."}}
+    or  {"name": "web_search", "parameters": {...}}
+    instead of using the proper tool_calls channel. Parse it and synthesize a
+    proper tool call so the pipeline still executes the search.
+
+    Returns a duck-typed object with the same shape as
+    ``ChatCompletionMessageToolCall`` (``.id``, ``.function.name``,
+    ``.function.arguments``), or ``None``.
+    """
+    if not content:
+        return None
+
+    payload_str: str | None = None
+    m = re.search(r"web_search\s*\{", content)
+    if m:
+        payload_str = _find_json_object(content, m.start())
+    if not payload_str:
+        m = re.search(r'\{\s*"name"\s*:\s*"web_search"', content)
+        if m:
+            payload_str = _find_json_object(content, m.start())
+    if not payload_str:
+        return None
+
+    try:
+        payload = json.loads(payload_str)
+    except json.JSONDecodeError:
+        return None
+
+    # Three shapes seen in the wild:
+    #   {"name": "web_search", "parameters": {...}}       ← OpenAI style
+    #   {"name": "web_search", "arguments": {...}}        ← Anthropic style
+    #   {"query": "...", "topic": "..."}                  ← direct args
+    if "parameters" in payload:
+        args = payload["parameters"]
+    elif "arguments" in payload:
+        args = payload["arguments"]
+    elif "query" in payload:
+        args = payload
+    else:
+        return None
+
+    if not isinstance(args, dict) or "query" not in args:
+        return None
+
+    tc = types.SimpleNamespace()
+    tc.id = f"text_call_{int(time.time() * 1000)}"
+    tc.type = "function"
+    tc.function = types.SimpleNamespace(
+        name="web_search",
+        arguments=json.dumps(args),
+    )
+    return tc
+
+
+# ── question gate ─────────────────────────────────────────────────────────
+# The tool schema is offered to the model on every turn, but small models
+# (llama-3.2-3b especially) will call web_search even for "hello" when the
+# tool is available. Rather than hope the model chooses wisely, we gate the
+# tool at the caller: it is only provided when the user asked something that
+# plausibly needs a live lookup.
+
+_QUESTION_WORDS = frozenset({
+    "who", "what", "when", "where", "why", "how", "which", "whose",
+})
+
+_SMALL_TALK_RE = re.compile(
+    r"^(?:"
+    # Greetings
+    r"(?:hi|hello|hey|yo|sup|good\s+(?:morning|afternoon|evening|night))"
+    # Acknowledgments / acknowledgments with punctuation
+    r"|(?:thanks?|thank\s+you|thx|cheers|ok|okay|cool|nice|great|awesome|sure"
+    r"|yes|no|yeah|nope|yep|hmm|uh\s*huh|got\s+it|i\s+see|alright|all\s+right"
+    r"|fine|good|perfect|excellent)"
+    # Goodbyes
+    r"|(?:bye|goodbye|see\s+you|later|good\s*night)"
+    # Meta / identity questions
+    r"|(?:what(?:'s|\s+is)\s+your\s+name|who\s+are\s+you|what\s+are\s+you"
+    r"|what\s+can\s+you\s+do|how\s+can\s+you\s+help|what\s+do\s+you\s+do"
+    r"|are\s+you\s+(?:there|ok|alive|human|real|listening|awake)"
+    r"|can\s+you\s+hear\s+me|do\s+you\s+understand)"
+    # Casual "how are you"
+    r"|(?:how\s+are\s+you|how(?:'s|\s+is)\s+it\s+going|how\s+do\s+you\s+do"
+    r"|what(?:'s|\s+is)\s+up|how'?s\s+your\s+day)"
+    # Pure chit-chat requests
+    r"|(?:tell\s+me\s+a\s+joke|say\s+something|sing\s+(?:me\s+)?a\s+song)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_LIVE_INFO_HINTS = (
+    "latest", "current", "today", "tonight", "right now", "just now",
+    "this week", "this month", "this year", "this morning", "this afternoon",
+    "news", "weather", "forecast", "temperature",
+    "score", "scores", "game", "match", "standings",
+    "price", "prices", "cost", "how much",
+    "stock", "stocks", "crypto", "bitcoin", "exchange rate",
+    "who won", "what's happening", "what happened", "what's new",
+    "search for", "look up", "google",
+)
+
+# Short "what is X" questions are stable knowledge (math, definitions,
+# names). The hint check above still wins for "what is the weather".
+_SHORT_WHAT_IS_RE = re.compile(
+    r"^what(?:'s|\s+is)\s+\S+(?:\s+\S+){0,3}\s*[.!?]?$", re.IGNORECASE
+)
+
+_MATH_QUESTION_RE = re.compile(
+    r"\b(?:what(?:'s|\s+is)\s+)?\d+\s*[\+\-\*/x×]\s*\d+\b", re.IGNORECASE
+)
+
+# Discourse markers that commonly lead a spoken utterance without carrying
+# content: "okay so…", "well what…", "um what's…", "hey who…". Stripping
+# them before the small-talk check is what makes "okay so what's the news"
+# correctly classified as a question instead of the bare "okay"
+# acknowledgement.
+_DISCOURSE_LEAD_RE = re.compile(
+    r"^(?:(?:okay|ok|alright|all\s+right|so|well|um+|uh+|er+|ah|oh|hmm+|hm"
+    r"|like|you\s+know|i\s+mean|anyway|anyways|right|now"
+    r"|hey|hi|hello)[,\s]+)+",
+    re.IGNORECASE,
+)
+
+# Strips any "web_search {json}" that leaked into the spoken output.
+_TOOL_CALL_TEXT_RE = re.compile(
+    r"(?:web_search|search_web|google)\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}",
+    re.IGNORECASE,
+)
+
+
+def _strip_tool_call_text(text: str) -> str:
+    """Remove any tool-call-shaped text a weak model emitted as content."""
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", _TOOL_CALL_TEXT_RE.sub(" ", text)).strip()
+
+
+def _should_search(text: str) -> bool:
+    """Return True only when the utterance plausibly needs a live web lookup.
+
+    Rules (first match wins):
+      * "search the web / look it up / google it" -> True
+      * "don't search / no search"                -> False
+      * small talk / greetings / meta             -> False
+      * obvious math question                     -> False
+      * short "what is X" (no live-info hints)    -> False
+      * ends with "?"                             -> True
+      * starts with who/what/when/where/why/how/which/whose -> True
+      * contains a live-info hint (latest, news, weather, price…) -> True
+      * otherwise                                 -> False
+    """
+    if not text or not text.strip():
+        return False
+
+    t = text.strip()
+
+    override = _check_voice_override(t)
+    if override == 1:
+        return True
+    if override == 0:
+        return False
+
+    # Strip leading discourse markers ("okay so", "well", "um") before the
+    # small-talk check. Without this, "okay so what's the news" is classified
+    # as the bare "okay" acknowledgement and no search fires — a real
+    # regression when the user starts a question with a filler.
+    stripped = _DISCOURSE_LEAD_RE.sub("", t).strip()
+    effective = stripped if stripped else t  # all discourse → leave for small-talk check
+
+    tl = effective.lower()
+
+    if _SMALL_TALK_RE.match(tl):
+        return False
+
+    if _MATH_QUESTION_RE.search(tl):
+        return False
+
+    has_hint = any(hint in tl for hint in _LIVE_INFO_HINTS)
+
+    if _SHORT_WHAT_IS_RE.match(tl) and not has_hint:
+        return False
+
+    if t.endswith("?"):
+        return True
+
+    first = tl.split()[0] if tl.split() else ""
+    if first in _QUESTION_WORDS:
+        return True
+
+    if has_hint:
+        return True
+
+    return False
 
 
 def _chunk_delta(chunk) -> str:
@@ -180,9 +444,12 @@ def build_messages(
     """
     if system_prompt is None:
         system_prompt = build_system_prompt()
-    if not history or history[0].get("role") != "system":
-        sys_msg: MessageParam = {"role": "system", "content": system_prompt}
-        history = [sys_msg] + history
+
+    system_message: MessageParam = {"role": "system", "content": system_prompt}
+    if history and history[0].get("role") == "system":
+        history = [system_message, *history[1:]]
+    else:
+        history = [system_message, *history]
 
     user_msg: MessageParam = {"role": "user", "content": user_text}
     history = history + [user_msg]
@@ -640,7 +907,16 @@ class LLMService:
         stream_fn,
         sentence_fn,
     ) -> AsyncGenerator[tuple[str, str], None]:
-        """Stream with tool calling support (up to 3 rounds)."""
+        """Stream with tool-calling support (up to 3 rounds).
+
+        Content produced in round 0 (when tools are available) is buffered until
+        the round ends. This is what stops weak models — llama-3.2-3b on
+        Cloudflare in particular — from leaking a "let me search" preamble into
+        the TTS stream. If a tool call happens, the buffered preamble is
+        discarded; if not, the buffer is emitted (with narration filtering).
+        Text-formatted tool calls (``web_search {...}`` written as content) are
+        detected and re-routed so the pipeline still executes them.
+        """
         if not tools:
             async for sentence, model in sentence_fn(messages, max_tokens, temperature):
                 yield sentence, model
@@ -668,24 +944,49 @@ class LLMService:
                 if settings.debug:
                     log.info("decision: DISABLE SEARCH -> %s", last_user_msg)
 
+        # Gate the web_search tool behind a question check. Casually chatting
+        # ("hello", "tell me a joke") should not trigger a live lookup —
+        # llama-3.2-3b will happily call web_search for anything if the tool
+        # is offered, so we simply don't offer it for non-questions.
+        search_ok = _should_search(last_user_msg) if last_user_msg else False
+        if settings.debug and last_user_msg:
+            log.info(
+                "search gate: %r -> %s",
+                last_user_msg[:80],
+                "SEARCH" if search_ok else "NO SEARCH",
+            )
+
         for round_num in range(max_tool_rounds):
-            if round_num == max_tool_rounds - 1:
+            is_final_round = round_num == max_tool_rounds - 1
+            if is_final_round:
                 current_tool_choice = "none"
                 round_tools = None
             else:
                 round_tools = tools
                 if round_num == 0:
                     if force_search:
-                        current_tool_choice = {"type": "function", "function": {"name": "web_search"}}
-                    elif disable_search:
+                        current_tool_choice = {
+                            "type": "function",
+                            "function": {"name": "web_search"},
+                        }
+                    elif not search_ok:
+                        # Not a question (or explicitly "don't search") — do not
+                        # offer the tool. With round_tools = None, no tool call
+                        # is possible, so round-0 content streams normally (no
+                        # buffering needed) and is still narration-filtered
+                        # inline below, so a hallucinated "let me search"
+                        # preamble is dropped.
                         current_tool_choice = "none"
                         round_tools = None
+
+            # Buffer only round 0. Round 1+ (after a tool result) streams normally:
+            # the model has the data it needs, so there is no preamble to leak.
+            buffer_content = (round_num == 0) and (round_tools is not None)
 
             tool_calls: list[ChatCompletionMessageToolCall] = []
             content_buffer = ""
             sentence_buffer = ""
             model_name = None
-            yielded_any = False
 
             try:
                 stream = await stream_fn(
@@ -717,21 +1018,36 @@ class LLMService:
                         content_buffer += content_delta
                         sentence_buffer += content_delta
 
+                        if buffer_content:
+                            continue  # hold — wait for the round to finish
+
                         if _SENTENCE_END.search(sentence_buffer):
                             for i in range(len(sentence_buffer) - 1, -1, -1):
                                 if sentence_buffer[i] in ".!?":
                                     sentence = sentence_buffer[: i + 1].strip()
                                     sentence_buffer = sentence_buffer[i + 1 :]
-                                    cleaned = sanitize_for_voice(sentence)
+                                    cleaned = _strip_tool_call_text(
+                                        _filter_narration(sanitize_for_voice(sentence))
+                                    )
                                     if cleaned:
                                         yield cleaned, model_name or settings.llm_model
-                                        yielded_any = True
                                     break
+
+                # Text-formatted tool call (weak-model fallback)
+                if round_tools is not None and not tool_calls:
+                    synth = _extract_text_tool_call(content_buffer)
+                    if synth is not None:
+                        log.warning(
+                            "model emitted tool call as text; synthesizing proper "
+                            "tool_calls entry: %s",
+                            synth.function.name,
+                        )
+                        tool_calls.append(synth)
 
                 if tool_calls:
                     assistant_msg: MessageParam = {
                         "role": "assistant",
-                        "content": content_buffer or "",
+                        "content": "",  # discard the narration preamble
                         "tool_calls": [
                             {
                                 "id": tc.id or f"call_{tc.function.name}_{round_num}",
@@ -785,12 +1101,34 @@ class LLMService:
 
                     continue
 
+                # No tool calls — this is the answer.
                 if settings.debug:
                     log.info("decision: ANSWER DIRECTLY")
-                if sentence_buffer.strip():
-                    cleaned = sanitize_for_voice(sentence_buffer.strip())
-                    if cleaned:
-                        yield cleaned, model_name or settings.llm_model
+                if buffer_content:
+                    emitted = 0
+                    for sentence in _split_sentences(content_buffer):
+                        cleaned = _strip_tool_call_text(
+                            _filter_narration(sanitize_for_voice(sentence))
+                        )
+                        if cleaned:
+                            yield cleaned, model_name or settings.llm_model
+                            emitted += 1
+                    if emitted == 0 and content_buffer.strip():
+                        # Everything was narration/tool text — strip and yield
+                        # whatever survives as a last resort.
+                        cleaned = _strip_tool_call_text(
+                            sanitize_for_voice(content_buffer)
+                        )
+                        if cleaned:
+                            yield cleaned, model_name or settings.llm_model
+                else:
+                    remainder = sentence_buffer.strip()
+                    if remainder:
+                        cleaned = _strip_tool_call_text(
+                            _filter_narration(sanitize_for_voice(remainder))
+                        )
+                        if cleaned:
+                            yield cleaned, model_name or settings.llm_model
                 return
 
             except asyncio.TimeoutError:
@@ -835,6 +1173,8 @@ class LLMService:
         buffer = ""
         try:
             async for chunk in stream:
+                if not chunk.choices:
+                    continue
                 delta = chunk.choices[0].delta.content if isinstance(chunk.choices[0].delta.content, str) else ""
                 buffer += delta
 
@@ -854,20 +1194,13 @@ class LLMService:
                 (time.perf_counter() - start) * 1000,
             )
             raise
-        finally:
+        else:
             remainder = buffer.strip()
             if remainder:
                 cleaned = sanitize_for_voice(remainder)
                 if cleaned:
-                    # When the task is cancelled during stream_response,
-                    # the async generator is being closed (GeneratorExit).
-                    # Yielding in a finally block under those conditions
-                    # raises "RuntimeError: async generator ignored
-                    # GeneratorExit", so guard against that.
-                    try:
-                        yield cleaned, model_name
-                    except RuntimeError:
-                        pass
+                    yield cleaned, model_name
+        finally:
             log.debug(
                 "LLM stream closed (latency=%.0fms)",
                 (time.perf_counter() - start) * 1000,
@@ -879,25 +1212,39 @@ class LLMService:
         max_tokens: int | None,
         temperature: float | None,
         tools: list[dict] | None = None,
-        tool_choice: str | dict | None = "auto",
+        tool_choice: str | dict | None = None,
     ):
-        """Create a raw stream from the primary LLM provider for tool calling."""
+        """Create a raw stream from the primary LLM provider for tool calling.
+
+        ``tools`` / ``tool_choice`` are only forwarded to the API when set, so a
+        ``None`` tools list never serializes as ``"tools": null`` paired with an
+        explicit tool_choice (the shape that confuses weaker models).
+        """
         client = self._get_client()
         if client is None:
             raise RuntimeError("LLM service is not configured (no API key)")
 
+        kwargs: dict = {
+            "model": settings.llm_model,
+            "messages": messages,
+            "max_tokens": max_tokens or settings.llm_max_tokens,
+            "temperature": temperature
+            if temperature is not None
+            else settings.llm_temperature,
+            "stream": True,
+        }
+        # tools and tool_choice are sent together only. When tools is None,
+        # tool_choice is semantically meaningless ("don't use tools I'm not
+        # offering") and omitting both keeps the request shape clean for the
+        # Cloudflare fallback path, where orphaned directives confuse
+        # llama-3.2-3b.
+        if tools is not None:
+            kwargs["tools"] = tools
+            if tool_choice is not None:
+                kwargs["tool_choice"] = tool_choice
+
         stream = await asyncio.wait_for(
-            client.chat.completions.create(
-                model=settings.llm_model,
-                messages=messages,
-                max_tokens=max_tokens or settings.llm_max_tokens,
-                temperature=temperature
-                if temperature is not None
-                else settings.llm_temperature,
-                stream=True,
-                tools=tools,
-                tool_choice=tool_choice,
-            ),
+            client.chat.completions.create(**kwargs),
             timeout=settings.llm_timeout_sec,
         )
         return stream
@@ -932,6 +1279,8 @@ class LLMService:
         buffer = ""
         try:
             async for chunk in stream:
+                if not chunk.choices:
+                    continue
                 delta = chunk.choices[0].delta.content if isinstance(chunk.choices[0].delta.content, str) else ""
                 buffer += delta
                 if _SENTENCE_END.search(buffer):
@@ -943,15 +1292,21 @@ class LLMService:
                             if cleaned:
                                 yield cleaned, model_name
                             break
-        finally:
+        except asyncio.TimeoutError:
+            log.warning(
+                "Cloudflare stream timed out after %.0f ms",
+                (time.perf_counter() - start) * 1000,
+            )
+            raise
+        except Exception:
+            raise
+        else:
             remainder = buffer.strip()
             if remainder:
                 cleaned = sanitize_for_voice(remainder)
                 if cleaned:
-                    try:
-                        yield cleaned, model_name
-                    except RuntimeError:
-                        pass
+                    yield cleaned, model_name
+        finally:
             log.debug(
                 "Cloudflare stream closed (latency=%.0fms)",
                 (time.perf_counter() - start) * 1000,
@@ -963,25 +1318,38 @@ class LLMService:
         max_tokens: int | None,
         temperature: float | None,
         tools: list[dict] | None = None,
-        tool_choice: str | dict | None = "auto",
+        tool_choice: str | dict | None = None,
     ):
-        """Create a raw stream from Cloudflare for tool calling."""
+        """Create a raw stream from Cloudflare for tool calling.
+
+        ``tools`` / ``tool_choice`` are only sent to the API when they are
+        actually set. Passing ``tools=None`` serializes as ``"tools": null``,
+        which combined with ``"tool_choice": "none"`` is a contradictory request
+        shape that the small ``llama-3.2-3b`` model burns reasoning budget
+        interpreting instead of answering. Omitting the fields entirely when
+        there is nothing to choose from keeps the request clean.
+        """
         client = self._get_cf_client()
         if client is None:
             raise RuntimeError("Cloudflare LLM fallback is not configured")
 
+        kwargs: dict = {
+            "model": settings.cf_model,
+            "messages": messages,
+            "max_tokens": max_tokens or settings.llm_max_tokens,
+            "temperature": temperature
+            if temperature is not None
+            else settings.llm_temperature,
+            "stream": True,
+        }
+        # tools and tool_choice are sent together only (see _stream_primary_raw).
+        if tools is not None:
+            kwargs["tools"] = tools
+            if tool_choice is not None:
+                kwargs["tool_choice"] = tool_choice
+
         stream = await asyncio.wait_for(
-            client.chat.completions.create(
-                model=settings.cf_model,
-                messages=messages,
-                max_tokens=max_tokens or settings.llm_max_tokens,
-                temperature=temperature
-                if temperature is not None
-                else settings.llm_temperature,
-                stream=True,
-                tools=tools,
-                tool_choice=tool_choice,
-            ),
+            client.chat.completions.create(**kwargs),
             timeout=settings.cf_timeout_sec,
         )
         return stream

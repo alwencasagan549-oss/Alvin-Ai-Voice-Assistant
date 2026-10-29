@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
@@ -412,3 +413,228 @@ async def test_shutdown_does_not_deadlock_on_full_queue():
             conn.consumer.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await conn.consumer
+
+
+@pytest.mark.asyncio
+async def test_speaker_buffer_only_collects_frames_after_vad_marks_speech(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    from app.config import settings
+
+    conn = _make_conn()
+    conn.speaker_service = object()
+    monkeypatch.setattr(settings, "speaker_enabled", True)
+
+    vad_states = iter((None, 0))
+
+    async def feed_vad() -> None:
+        conn.seg_start = next(vad_states)
+
+    monkeypatch.setattr(conn, "_feed_vad", feed_vad)
+    frame = np.full(512, 8192, dtype="<i2").tobytes()
+
+    await conn._on_audio(frame)
+    assert not conn.speaker_audio_buffer
+
+    await conn._on_audio(frame)
+    assert len(conn.speaker_audio_buffer) == 1
+    assert np.allclose(conn.speaker_audio_buffer[0], 0.25)
+
+
+def test_speaker_audio_buffer_tracks_a_bounded_sample_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    from app.config import settings
+
+    conn = _make_conn()
+    conn.speaker_service = object()
+    monkeypatch.setattr(settings, "speaker_enabled", True)
+    monkeypatch.setattr(settings, "speaker_max_identify_sec", 0.01)
+
+    for _ in range(5):
+        conn._buffer_audio_for_speaker_id(np.ones(100, dtype=np.float32))
+
+    assert conn._speaker_buffer_samples <= 160
+    assert conn._speaker_buffer_samples == sum(
+        chunk.size for chunk in conn.speaker_audio_buffer
+    )
+    assert len(conn.speaker_audio_buffer) == 1
+
+
+@pytest.mark.asyncio
+async def test_speaker_identification_clears_buffer_and_sample_count() -> None:
+    import numpy as np
+
+    from app.config import settings
+
+    conn = _make_conn()
+    conn.speaker_audio_buffer.append(
+        np.ones(settings.sample_rate, dtype=np.float32)
+    )
+    conn._speaker_buffer_samples = settings.sample_rate
+
+    class UnknownSpeaker:
+        async def identify(self, audio):
+            return SimpleNamespace(is_known=False, similarity=0.0)
+
+    conn.speaker_service = UnknownSpeaker()
+    await conn._identify_speaker()
+
+    assert not conn.speaker_audio_buffer
+    assert conn._speaker_buffer_samples == 0
+
+
+@pytest.mark.asyncio
+async def test_final_utterance_does_not_wait_for_speaker_identification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    from app.config import settings
+
+    conn = _make_conn()
+    monkeypatch.setattr(settings, "speaker_enabled", True)
+    monkeypatch.setattr(settings, "echo_mode", "off")
+    monkeypatch.setattr(settings, "llm_api_key", "")
+    monkeypatch.setattr(settings, "groq_api_key", "")
+    conn.speaker_audio_buffer.append(np.ones(settings.sample_rate, dtype=np.float32))
+    conn._speaker_buffer_samples = settings.sample_rate
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    class SlowSpeaker:
+        async def identify(self, audio):
+            started.set()
+            await finish.wait()
+            return SimpleNamespace(
+                is_known=False,
+                speaker_id=None,
+                name=None,
+                similarity=0.0,
+            )
+
+    conn.speaker_service = SlowSpeaker()
+
+    try:
+        await asyncio.wait_for(
+            conn._handle_final_utterance("tell me something interesting"),
+            timeout=0.05,
+        )
+        await asyncio.wait_for(started.wait(), timeout=0.05)
+        assert conn.speaker_identification_pending
+    finally:
+        finish.set()
+        await asyncio.sleep(0)
+
+
+def _known_speaker(speaker_id: str = "alice", name: str = "Alice", similarity: float = 0.91):
+    """An identification result for an enrolled speaker."""
+    return SimpleNamespace(
+        is_known=True,
+        speaker_id=speaker_id,
+        name=name,
+        similarity=similarity,
+    )
+
+
+def _unknown_speaker(similarity: float = 0.31):
+    """An identification result below the similarity threshold."""
+    return SimpleNamespace(
+        is_known=False,
+        speaker_id=None,
+        name=None,
+        similarity=similarity,
+    )
+
+
+class _StubSpeaker:
+    """Speaker service stub that returns queued identification results."""
+
+    def __init__(self, *results) -> None:
+        self._results = list(results)
+        self.calls = 0
+
+    async def identify(self, audio):
+        self.calls += 1
+        index = min(self.calls - 1, len(self._results) - 1)
+        return self._results[index]
+
+
+def _seed_speaker_buffer(conn: Connection) -> None:
+    """Put one second of speech in the speaker buffer so ID runs."""
+    import numpy as np
+
+    from app.config import settings
+
+    conn.speaker_audio_buffer.append(np.ones(settings.sample_rate, dtype=np.float32))
+    conn._speaker_buffer_samples = settings.sample_rate
+
+
+def _speaker_events(conn: Connection) -> list[dict]:
+    """Decode the JSON events the connection has sent to the client."""
+    events = []
+    for frame in conn.ws.received_frames:
+        if isinstance(frame, (bytes, bytearray)):
+            payload = json.loads(frame)
+            if isinstance(payload, dict):
+                events.append(payload)
+    return events
+
+
+@pytest.mark.asyncio
+async def test_a_single_unknown_turn_keeps_the_current_speaker_context() -> None:
+    """One unknown turn is not enough evidence to drop the speaker context."""
+    conn = _make_conn()
+    conn.speaker_service = _StubSpeaker(_known_speaker(), _unknown_speaker())
+
+    for _ in range(2):
+        _seed_speaker_buffer(conn)
+        await conn._identify_speaker()
+
+    assert conn.current_speaker_id == "alice"
+    assert conn.current_speaker_name == "Alice"
+
+
+@pytest.mark.asyncio
+async def test_two_consecutive_unknown_turns_clear_the_stale_speaker_context() -> None:
+    """Repeated unknown speakers must not be greeted as the last known one."""
+    conn = _make_conn()
+    conn.speaker_service = _StubSpeaker(
+        _known_speaker(), _unknown_speaker(), _unknown_speaker()
+    )
+
+    for _ in range(2):
+        _seed_speaker_buffer(conn)
+        await conn._identify_speaker()
+    assert conn.current_speaker_name == "Alice"
+
+    _seed_speaker_buffer(conn)
+    await conn._identify_speaker()
+
+    assert conn.current_speaker_id is None
+    assert conn.current_speaker_name is None
+    assert _speaker_events(conn)[-1] == {
+        "type": "speaker_change",
+        "speaker_id": None,
+        "name": None,
+        "similarity": 0.31,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_known_speaker_resets_the_unknown_streak() -> None:
+    """Re-identifying a known speaker restarts the unknown-speaker count."""
+    conn = _make_conn()
+    conn.speaker_service = _StubSpeaker(
+        _known_speaker(), _unknown_speaker(), _known_speaker(), _unknown_speaker()
+    )
+
+    for _ in range(4):
+        _seed_speaker_buffer(conn)
+        await conn._identify_speaker()
+
+    assert conn.current_speaker_name == "Alice"
