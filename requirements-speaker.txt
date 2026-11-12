@@ -1,0 +1,4 @@
+-r requirements.txt
+torch>=2.2,<3
+torchaudio>=2.2,<3
+speechbrain>=1.0,<2

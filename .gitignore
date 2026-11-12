@@ -1,0 +1,51 @@
+# --------------------------------------------------------------------------- #
+# Python / virtual environment
+# --------------------------------------------------------------------------- #
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pip-cache/
+%TEMP%/
+.claude/
+.kilo/
+.vscode/
+
+# --------------------------------------------------------------------------- #
+# Test / lint caches
+# --------------------------------------------------------------------------- #
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --------------------------------------------------------------------------- #
+# Secrets — never commit real API keys. Use .env.example as the template.
+# --------------------------------------------------------------------------- #
+.env
+
+# --------------------------------------------------------------------------- #
+# Generated voice previews (~14 MB). Regenerate with:
+#   python scripts/tts_voice_samples.py
+# --------------------------------------------------------------------------- #
+voice_samples/
+
+# --------------------------------------------------------------------------- #
+# One-off debugging / scratch benchmarking (not part of the shipped app)
+# --------------------------------------------------------------------------- #
+scripts/diag_*.py
+scripts/measure_turn_latency.py
+nv_*.py
+nv_*.json
+test model*.png
+
+# PID ownership record used by start-all.ps1 -Stop
+.alvin-servers.json
+
+# Local speaker identification profiles contain serialized voice embeddings.
+speaker_profiles.pkl
+
+# Piper TTS voice models (large binary files)
+piper_voices/
