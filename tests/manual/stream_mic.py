@@ -51,6 +51,12 @@ Options:
 
 from __future__ import annotations
 
+import os, sys
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+
 import argparse
 import asyncio
 import contextlib
@@ -80,7 +86,6 @@ FRAME_BYTES = FRAME_SAMPLES * 2  # int16 = 2 bytes per sample
 PING_INTERVAL = 15.0
 DEFAULT_VAD_THRESHOLD = 0.5
 DEFAULT_VAD_FRAMES = 2
-PLAYBACK_STOP_TIMEOUT = 2.0
 
 
 def _setup_global_hotkey(ptt_state_queue: queue.Queue[bool], on_hotkey=None) -> None:
@@ -158,6 +163,8 @@ def _auth_headers(token: str | None) -> dict[str, str]:
     return {}
 
 
+from scripts.audio_playback import AudioPlayer, PLAYBACK_BLOCK_SEC
+
 async def stream_mic(
     uri: str,
     token: str | None,
@@ -168,8 +175,7 @@ async def stream_mic(
     ptt_mode: str = "console",
 ) -> None:
     mic_queue: asyncio.Queue[bytes] = asyncio.Queue()
-    audio_queue: asyncio.Queue[bytes] = asyncio.Queue()
-    playback_task: asyncio.Task | None = None
+    player = AudioPlayer(SAMPLE_RATE, CHANNELS)
     speech_onset_count = 0
     tts_playing = False
     ptt_enabled = False
@@ -178,31 +184,13 @@ async def stream_mic(
     model = load_silero_vad(onnx=True)
     vad = VADIterator(model, threshold=vad_threshold, sampling_rate=SAMPLE_RATE)
 
-    async def flush_playback():
-        """Drain the TTS playback queue and stop the playback task."""
-        nonlocal playback_task, tts_playing
-        if playback_task is None or playback_task.done():
-            return
-        while not audio_queue.empty():
-            try:
-                audio_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-        await audio_queue.put(None)
-        with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
-            await asyncio.wait_for(playback_task, timeout=PLAYBACK_STOP_TIMEOUT)
-        playback_task = None
-        tts_playing = False
-
     loop = asyncio.get_running_loop()
 
     def _flush_and_enable_ptt():
         try:
-            fut = asyncio.run_coroutine_threadsafe(flush_playback(), loop)
-            fut.result(timeout=2)
-        except Exception as exc:
+            player.flush()
+        except Exception as exc:  # noqa: BLE001
             print(f"[ptt] flush failed: {exc}", file=sys.stderr, flush=True)
-        # Simple: always enable PTT when the hotkey is pressed
         ptt_state_queue.put_nowait(True)
 
     # Set up PTT hotkey with fallback
@@ -214,7 +202,11 @@ async def stream_mic(
     def audio_callback(indata, frames, time_info, status):
         if status:
             print(f"[audio-callback] {status}", file=sys.stderr, flush=True)
-        mic_queue.put_nowait(indata.tobytes())
+        # PortAudio invokes this on its own high-priority thread; never touch
+        # the asyncio queue directly from here.  Hand the frame to the event
+        # loop with the thread-safe scheduling API.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(mic_queue.put_nowait, indata.tobytes())
 
     async def send_audio(websocket):
         nonlocal speech_onset_count, tts_playing, ptt_enabled
@@ -232,7 +224,8 @@ async def stream_mic(
                     json.dumps({"type": "talk", "active": ptt_enabled})
                 )
                 if ptt_enabled:
-                    await flush_playback()
+                    player.flush()
+                    tts_playing = False
                     speech_onset_count = 0
                 print(f"[ptt] State changed: {'ON' if ptt_enabled else 'OFF'}", flush=True)
 
@@ -246,6 +239,11 @@ async def stream_mic(
                 samples = np.frombuffer(frame, dtype="<i2").astype(np.float32) / 32768.0
                 result = vad(samples)  # keep feeding VAD so its state stays coherent
 
+                # "Speaking" covers the server-side turn (tts_playing) *and* the
+                # local buffer still draining after tts_end, so the mic stays
+                # muted until the speaker is actually quiet.
+                speaking = tts_playing or player.is_playing()
+
                 # Barge-in is only trusted while Alvin is NOT speaking. While TTS
                 # is playing, the microphone also picks up Alvin's own voice, and
                 # counting that echo as a "speech onset" makes the client flush
@@ -253,7 +251,7 @@ async def stream_mic(
                 # gets cut off" bug seen when the room is quiet). True echo
                 # cancellation (AEC) would let barge-in stay live during playback;
                 # without it we must suppress onset detection while speaking.
-                if tts_playing:
+                if speaking:
                     speech_onset_count = 0
                 elif result and "start" in result:
                     speech_onset_count += 1
@@ -263,49 +261,30 @@ async def stream_mic(
                             f"({speech_onset_count} frames), flushing TTS",
                             flush=True,
                         )
-                        await flush_playback()
+                        player.flush()
+                        tts_playing = False
                         speech_onset_count = 0
                 elif result and "end" in result:
                     speech_onset_count = 0
 
-                # Mic audio is sent only when PTT is on and the assistant
-                # is not currently speaking. When PTT is off the server
-                # discards the audio; when TTS is playing we mute locally
-                # so the assistant does not hear its own voice.
-                if ptt_enabled and not tts_playing:
+                # Mic audio is sent only when PTT is on and Alvin is not
+                # speaking. When PTT is off the server discards the audio; while
+                # TTS is playing we mute locally so the assistant does not hear
+                # its own voice (echo feedback loop).
+                if ptt_enabled and not speaking:
                     await websocket.send(frame)
 
-    async def play_tts_audio():
-        nonlocal tts_playing
-        stream = sd.OutputStream(
-            samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="int16"
-        )
-        stream.start()
-        try:
-            while True:
-                data = await audio_queue.get()
-                if data is None:
-                    break
-                stream.write(np.frombuffer(data, dtype="<i2"))
-        except OSError as e:
-            print(f"[playback] audio error: {e}", file=sys.stderr, flush=True)
-        finally:
-            if stream.active:
-                stream.stop()
-            stream.close()
-
     async def receive_loop(websocket):
-        nonlocal playback_task, tts_playing, speech_onset_count, ptt_enabled
+        nonlocal tts_playing, speech_onset_count, ptt_enabled
         while True:
             msg = await websocket.recv()
             if isinstance(msg, bytes):
                 if ptt_enabled:
                     continue
-                if playback_task is None or playback_task.done():
-                    playback_task = asyncio.create_task(play_tts_audio())
+                if not tts_playing:
                     tts_playing = True
                     speech_onset_count = 0
-                await audio_queue.put(msg)
+                player.submit(msg)
             else:
                 obj = json.loads(msg)
                 msg_type = obj.get("type", "")
@@ -327,8 +306,6 @@ async def stream_mic(
                     else:
                         print("Idle", flush=True)
                 elif msg_type == "tts_end":
-                    if playback_task is not None and playback_task.done():
-                        playback_task = None
                     tts_playing = False
                 elif msg_type == "tts_error":
                     tts_playing = False
@@ -362,19 +339,32 @@ async def stream_mic(
         if vad_threshold != DEFAULT_VAD_THRESHOLD:
             print(f"[vad] threshold={vad_threshold}, frames={vad_frames}", flush=True)
 
-        stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="int16",
-            callback=audio_callback,
-        )
-
-        with stream:
-            await asyncio.gather(
-                send_audio(websocket),
-                receive_loop(websocket),
-                ping_loop(websocket),
+        player.start()
+        try:
+            input_stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+                callback=audio_callback,
             )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[mic] cannot open input device: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            player.close()
+            return
+
+        try:
+            with input_stream:
+                await asyncio.gather(
+                    send_audio(websocket),
+                    receive_loop(websocket),
+                    ping_loop(websocket),
+                )
+        finally:
+            player.close()
 
 
 if __name__ == "__main__":

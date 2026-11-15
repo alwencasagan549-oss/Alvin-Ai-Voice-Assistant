@@ -97,6 +97,7 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.llm_api_key == ""
     assert settings.llm_base_url == "https://api.kilo.ai/api/gateway"
     assert settings.llm_model == "nvidia/nemotron-3.5-lightning:free"
+    assert settings.llm_vision_model == "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
     assert settings.llm_enabled is True
     assert settings.llm_max_tokens == 200
     assert settings.llm_temperature == 0.7
@@ -112,6 +113,7 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.max_llm_history == 12
     assert settings.llm_max_history_tokens == 2000
     assert settings.transcription_queue_maxsize == 200
+    assert settings.audio_worker_threads == 8
 
 
 def test_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -179,6 +181,7 @@ def test_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         ("MAX_LLM_HISTORY", "20", "max_llm_history", int),
         ("LLM_MAX_HISTORY_TOKENS", "3000", "llm_max_history_tokens", int),
         ("TRANSCRIPTION_QUEUE_MAXSIZE", "50", "transcription_queue_maxsize", int),
+        ("AUDIO_WORKER_THREADS", "12", "audio_worker_threads", int),
     ]
 
     for case in test_cases:

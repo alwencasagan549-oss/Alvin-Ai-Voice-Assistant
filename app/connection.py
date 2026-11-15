@@ -30,6 +30,7 @@ import logging
 import os
 import secrets
 import signal
+import subprocess
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -63,10 +64,10 @@ from .llm import (
 )
 from .web_search import WEB_SEARCH_TOOL_SCHEMA
 from .speaker import get_speaker_service
-from .stt import STTService, TranscriptionResult, audio_dbfs
+from .stt import STTService, audio_dbfs
 from .tts import synthesize_stream
 from .vad import FRAME_SAMPLES, VADStreamDetector
-from .youtube import fallback_search_url, search_youtube
+from .youtube import fallback_search_url, resolve_stream_url, search_youtube
 
 # Initial capacity of the per-connection audio accumulator, in samples
 # (~2 s at 16 kHz). It doubles on demand up to one utterance's worth, so a
@@ -109,6 +110,33 @@ def _request_shutdown() -> None:
     log.info("shutdown: requesting server shutdown (SIGINT)")
     os.kill(os.getpid(), signal.SIGINT)
 
+
+def _request_laptop_shutdown(delay_sec: float) -> None:
+    """Power off the machine the assistant runs on ("turn off my laptop").
+
+    Windows gets the native ``shutdown /s /t N`` countdown (``shutdown /a``
+    cancels it). Unix falls back to ``shutdown -h now`` and is best-effort:
+    it only works if the account has the required privilege. This is the only
+    place in the codebase that powers off the OS; the AI-server ``shutdown``
+    intent above never does.
+    """
+    delay = max(0, int(delay_sec))
+    try:
+        if os.name == "nt":
+            subprocess.Popen(
+                ["shutdown", "/s", "/t", str(delay)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            subprocess.Popen(
+                ["shutdown", "-h", "now"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except Exception:
+        log.exception("laptop shutdown: failed to invoke the OS shutdown command")
+
 # Sentinel values for text control messages supported by clients.
 _CONTROL_CONFIG = "config"
 _CONTROL_STOP = "stop"
@@ -119,7 +147,13 @@ _CONTROL_TALK = "talk"
 _CONTROL_CONTROL = "control"
 _CONTROL_RESET = "reset"
 _CONTROL_CAMERA_FRAME = "camera_frame"
+_CONTROL_CAMERA_CLOSE = "camera_close"
 _CONTROL_REQUEST_CAMERA_FRAME = "request_camera_frame"
+_CONTROL_OPEN_SYSTEM = "open_system"
+
+#: React dashboard dev server. ``show_dashboard`` opens it in a browser;
+#: ``open_system`` tells the HUD to load it in its embedded system window.
+_DASHBOARD_URL = "http://127.0.0.1:5173"
 
 _NONE_LANGS = {"auto", "none", "null", ""}
 
@@ -203,12 +237,20 @@ def verify_token(websocket: WebSocket) -> bool:
 
 @dataclass
 class _PendingSegment:
-    """A speech slice awaiting transcription."""
+    """A speech slice awaiting transcription.
+
+    ``is_dropped`` marks a tombstone: a final segment the producer abandoned
+    (e.g. the transcription queue stayed full past the wait window). It carries
+    no audio and is never sent to STT; the consumer emits a ``dropped`` event at
+    its FIFO position so the client is told this utterance produced no result,
+    in order relative to every other queued segment.
+    """
 
     audio: np.ndarray
     is_partial: bool
     is_final: bool
     utterance_id: int = 0
+    is_dropped: bool = False
 
 
 class Connection:
@@ -225,6 +267,16 @@ class Connection:
         self.stt = stt
         self.detector = detector
         self.language = language
+        # True when this socket belongs to the PySide6 HUD (the client announces
+        # itself in its ``config`` frame). A HUD started hidden by start.bat
+        # already owns the microphone; "wake up" should reveal that window
+        # instead of spawning a second one.
+        self.is_hud_client = False
+        # True while the HUD is playing the ad-free direct stream in a local
+        # player (VLC/mpv/ffplay). "stop the music" then only terminates that
+        # player -- it must not focus the browser to close a tab that does not
+        # exist.
+        self.youtube_local_playback = False
 
         # Audio accumulator + VAD read pointer. The buffer is reset whenever a
         # finalized segment completes so memory stays bounded to ~one utterance.
@@ -269,6 +321,10 @@ class Connection:
         self.camera_image_b64: str | None = None
         self.camera_active: bool = False
         self._camera: cv2.VideoCapture | None = None
+        # Bumped on every camera close. A frame save started before a close
+        # checks this after its disk work and discards itself instead of
+        # re-arming camera mode with a stale frame.
+        self._camera_generation: int = 0
 
         # Mic-control audio gating: when the user mutes the microphone,
         # incoming segments run a local-only keyword pass (never the cloud)
@@ -344,13 +400,9 @@ class Connection:
             except asyncio.QueueFull:
                 pass
             await self._cancel_ongoing_turn()
-            # Release the camera if it was opened.
-            if self._camera is not None:
-                try:
-                    self._camera.release()
-                except Exception:
-                    pass
-                self._camera = None
+            # Release the camera and drop the stored frame so teardown matches
+            # the close paths (no temp frame jpg left behind on disconnect).
+            self._close_camera_state()
             if self.consumer is not None:
                 try:
                     await asyncio.wait_for(self.consumer, timeout=_CONSUMER_SHUTDOWN_TIMEOUT_SEC)
@@ -427,6 +479,8 @@ class Connection:
             return
         ctype = data.get("type")
         if ctype == _CONTROL_CONFIG:
+            if data.get("client") == "hud":
+                self.is_hud_client = True
             lang = data.get("language")
             if lang is not None:
                 self.language = _resolve_language(lang)
@@ -447,8 +501,15 @@ class Connection:
             if isinstance(speak_text, str) and speak_text.strip():
                 await self._cancel_ongoing_turn()
                 await self._start_tts(speak_text, data.get("voice"))
+        elif ctype == "youtube_playback":
+            # The HUD reports whether it started the ad-free local player or
+            # fell back to opening the browser. "stop the music" closes a
+            # browser tab only in the fallback case.
+            self.youtube_local_playback = bool(data.get("local"))
         elif ctype == _CONTROL_STOP_SPEAK:
-            await self._cancel_ongoing_turn()
+            # Send tts_stop so clients that gate their mic on playback (the HUD)
+            # reopen capture; a cancelled task never emits tts_end.
+            await self._cancel_ongoing_turn(send_tts_stop=True)
         elif ctype == _CONTROL_TALK:
             active = data.get("active")
             if active is not None:
@@ -478,20 +539,41 @@ class Connection:
             self.echo.reset_cooldown()
             self._reset_segment()      # drains the buffer + VAD
             self._cancel_ptt_timeout()
+        elif ctype == _CONTROL_OPEN_SYSTEM:
+            # HUD pressed its SYS button (or opened the system window): make
+            # sure the dashboard dev server is listening, then confirm so the
+            # embedded view can reload into it.
+            running = await self._ensure_dashboard_running()
+            await self._send_raw({
+                "type": "command",
+                "intent": "open_system",
+                "slots": {"dashboard_ready": running},
+            })
         elif ctype == _CONTROL_CAMERA_FRAME:
             # Client captured a frame from its camera stream; store it so the
-            # "what do you see" vision intent can analyze it.
+            # "what do you see" vision intent can analyze it. The generation
+            # snapshot lets the save discard itself if a close lands while it
+            # is in flight.
             image_b64 = data.get("image")
             if isinstance(image_b64, str) and image_b64.strip():
+                generation = self._camera_generation
                 try:
                     await asyncio.to_thread(
-                        self._save_camera_frame_sync, image_b64
+                        self._save_camera_frame_sync, image_b64, generation
                     )
                 except Exception:
                     log.exception("Failed to save camera frame")
         elif ctype == _CONTROL_REQUEST_CAMERA_FRAME:
             # Server requested a fresh camera frame; forward to client
             await self._send_raw({"type": "request_camera_frame"})
+        elif ctype == _CONTROL_CAMERA_CLOSE:
+            # Client closed its camera popup (UI button). Drop the stored
+            # frame so ``camera_mode`` turns off and the next utterance is
+            # answered by the main brain again instead of the camera vision
+            # model with a stale image. No command echo (the client already
+            # closed its popup) and no spoken confirmation (button action).
+            log.info("camera_close control frame; clearing camera state")
+            self._close_camera_state()
         # Unknown control messages are ignored for forward compatibility.
 
     async def _set_ptt_active(self, active: bool) -> None:
@@ -513,8 +595,14 @@ class Connection:
         # Notify client of PTT state change
         await self._send_raw({"type": "ptt_state", "active": active})
 
-    def _save_camera_frame_sync(self, image_b64: str) -> None:
-        """Synchronously decode and persist a camera frame (runs in a thread)."""
+    def _save_camera_frame_sync(self, image_b64: str, generation: int) -> None:
+        """Synchronously decode and persist a camera frame (runs in a thread).
+
+        ``generation`` is the camera state generation snapshotted before the
+        save started. If a close landed while the save was in flight, the
+        frame is stale: discard it (and its temp file) instead of re-arming
+        camera mode after the close.
+        """
         import base64 as _b64
         import os as _os
         import tempfile as _tempfile
@@ -524,6 +612,22 @@ class Connection:
         fd, path = _tempfile.mkstemp(suffix=".jpg", prefix="alvin_camera_")
         with _os.fdopen(fd, "wb") as f:
             f.write(image_data)
+        if generation != self._camera_generation:
+            try:
+                _os.remove(path)
+            except OSError:
+                pass
+            log.info("camera frame discarded (camera closed during capture)")
+            return
+        # Re-check after the filesystem work (os.remove of the previous frame can
+        # take milliseconds on Windows): a close that landed in between must win.
+        if generation != self._camera_generation:
+            try:
+                _os.remove(path)
+            except OSError:
+                pass
+            log.info("camera frame discarded (camera closed during capture)")
+            return
         if self.camera_image_path and _os.path.isfile(self.camera_image_path):
             try:
                 _os.remove(self.camera_image_path)
@@ -534,6 +638,31 @@ class Connection:
         self.camera_active = True
         self._camera_frame_ts = _time.monotonic()
         log.info("camera frame stored: %s bytes, path=%s", len(image_b64), path)
+
+    def _close_camera_state(self) -> None:
+        """Drop the stored camera frame and release any server-side capture.
+
+        Shared by the voice command (``close the camera``), the
+        ``camera_close`` control message (client UI button), and connection
+        teardown. Clearing the frame is what flips ``camera_mode`` off, which
+        switches the LLM back from the camera vision model to the main brain.
+        Bumping the generation invalidates any frame save already in flight.
+        """
+        self._camera_generation += 1
+        self.camera_active = False
+        self.camera_image_b64 = None
+        if self.camera_image_path and os.path.isfile(self.camera_image_path):
+            try:
+                os.remove(self.camera_image_path)
+            except OSError:
+                pass
+        self.camera_image_path = None
+        if self._camera is not None:
+            try:
+                self._camera.release()
+            except Exception:
+                pass
+            self._camera = None
 
     @staticmethod
     def _observe_background_task(task: asyncio.Task, label: str) -> None:
@@ -691,24 +820,63 @@ class Connection:
                 timeout=_FINAL_QUEUE_TIMEOUT_SEC * 3.0,
             )
         except asyncio.TimeoutError:
+            # The consumer is stuck (e.g. a very slow cloud STT) and the queue
+            # stayed full past the wait window. Drop this final and reset.
+            #
+            # The previous behavior processed the segment *directly* here
+            # (awaiting STT and calling _handle_final_utterance inline). That
+            # ran concurrently with the consumer task, which may still be
+            # draining older items, so two finals could reach
+            # _handle_final_utterance out of order and corrupt conversation
+            # history (both the direct path and the consumer append to it).
+            # Dropping keeps a single, ordered path: only the consumer ever
+            # calls STT and mutates history for finals.
             log.warning(
-                "transcription queue full for %.1fs; processing final segment directly",
+                "transcription queue full for %.1fs; dropping final segment "
+                "(consumer is backlogged)",
                 _FINAL_QUEUE_TIMEOUT_SEC * 3.0,
             )
-            # Try to process directly as fallback
-            try:
-                result = await self.stt.transcribe_async(seg, self.language)
-                await self._send_event(
-                    result.text, False, True, result.confidence, result.model
-                )
-                if result.text.strip():
-                    await self._handle_final_utterance(result.text, result.confidence)
-            except Exception:
-                log.exception("direct final segment processing failed")
+            # Enqueue a tombstone so the client is told (in FIFO order, by the
+            # consumer) that this utterance produced no result. The queue is
+            # full, so make room by evicting the oldest item -- it is a stale
+            # partial or an already-superseded segment, and the tombstone still
+            # lands after every remaining earlier item, preserving ordering.
+            self._enqueue_drop_tombstone(self._utterance_id)
+            self._utterance_id += 1
             self._reset_segment()
             return
         self._utterance_id += 1
         self._reset_segment()
+
+    def _enqueue_drop_tombstone(self, utterance_id: int) -> None:
+        """Best-effort ordered enqueue of a ``dropped`` marker.
+
+        Evicts the oldest queued item if the queue is full so the tombstone can
+        be appended at the tail. If eviction also fails (the queue is being
+        drained concurrently and stays full), the drop is logged and skipped;
+        the segment was still reset by the caller, so the pipeline stays
+        consistent even without the client event.
+        """
+        tombstone = _PendingSegment(
+            np.empty(0, dtype=np.float32),
+            is_partial=False,
+            is_final=True,
+            utterance_id=utterance_id,
+            is_dropped=True,
+        )
+        try:
+            self.queue.put_nowait(tombstone)
+            return
+        except asyncio.QueueFull:
+            pass
+        try:
+            self.queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            self.queue.put_nowait(tombstone)
+        except asyncio.QueueFull:
+            log.warning("could not enqueue dropped-final tombstone; queue full")
 
     async def _flush_pending(self) -> None:
         """Flush any in-progress utterance as a final on shutdown/stop."""
@@ -790,15 +958,29 @@ class Connection:
     # Transcription consumer
     # ------------------------------------------------------------------ #
     async def _consume(self) -> None:
-        current_utterance_id = 0
         while True:
             item = await self.queue.get()
             if item is None:
                 break
             if not isinstance(item, _PendingSegment):
                 continue
-            # Skip stale partials from previous utterances
-            if item.is_partial and item.utterance_id < current_utterance_id:
+            # Tombstone: a final the producer dropped (queue stayed full past the
+            # wait window). Emit the "dropped" event at its FIFO position so the
+            # client learns this utterance produced no result, in order relative
+            # to every other queued segment. Never sent to STT.
+            if item.is_dropped:
+                try:
+                    await self._send_event("", False, True, 0.0, "dropped")
+                except Exception:
+                    pass
+                continue
+            # Skip stale partials from previous utterances. Compare against the
+            # producer-owned counter (self._utterance_id), which is bumped
+            # synchronously whenever a segment is finalized or dropped: the
+            # consumer-local current_utterance_id only advances on a *consumed*
+            # final, so a dropped final would otherwise leave its queued
+            # partials eligible for transcription.
+            if item.is_partial and item.utterance_id < self._utterance_id:
                 continue
             # Muted mode never sends partials or finals to the cloud STT path.
             if self.is_muted:
@@ -818,8 +1000,6 @@ class Connection:
                     await self._send_event("", False, True, 0.0, "timeout")
                 except Exception:
                     pass
-                if item.is_final:
-                    current_utterance_id = item.utterance_id + 1
                 continue
             except Exception as exc:
                 log.exception("transcription failed")
@@ -831,14 +1011,11 @@ class Connection:
                     await self._send_event("", False, True, 0.0, "error")
                 except Exception:
                     pass
-                if item.is_final:
-                    current_utterance_id = item.utterance_id + 1
                 continue
             await self._send_event(
                 result.text, item.is_partial, item.is_final, result.confidence, result.model
             )
             if item.is_final:
-                current_utterance_id = item.utterance_id + 1
                 if result.text.strip():
                     try:
                         await self._handle_final_utterance(result.text, result.confidence)
@@ -943,13 +1120,18 @@ class Connection:
             removed = self.speaker_audio_buffer.popleft()
             self._speaker_buffer_samples -= removed.size
 
-    async def _prepare_vision_messages(self, text: str) -> list[MessageParam]:
+    async def _prepare_vision_messages(self, text: str) -> list[MessageParam] | None:
         """Build the vision-turn message list from the latest camera frame.
 
         Encapsulated so :meth:`_handle_final_utterance` can fail fast and return
         early on a setup error instead of falling through to a mixed
         vision/text turn. Raises on any failure; the caller emits the
         ``vision_setup_failed`` ``llm_error`` and speaks a short fallback.
+
+        Returns ``None`` when the camera was closed while this turn was being
+        prepared (e.g. a ``camera_close`` landed during the stale-frame wait):
+        the caller then falls through to the plain text path so the turn is
+        answered by the main brain instead of the vision model without a frame.
         """
         import time as _time
 
@@ -964,6 +1146,11 @@ class Connection:
                 if getattr(self, "_camera_frame_ts", 0) > deadline - 2.0:
                     break
                 await asyncio.sleep(0.05)
+        if self.camera_image_b64 is None:
+            # The camera was closed while waiting; a text-only turn must not
+            # be answered by the vision model.
+            log.info("camera closed during vision preparation; falling back to text")
+            return None
 
         today = __import__("datetime").date.today().isoformat()
         vision_prompt = (
@@ -1063,15 +1250,21 @@ class Connection:
 
         # Build the message list: system prompt + trimmed history + new user turn.
         # When the camera is active, attach the latest frame so the LLM can see
-        # what is in front of it and answer in context. The vision model
-        # (Nemotron 3.5 Super VL) is used for these turns.
+        # what is in front of it and answer in context. The camera vision model
+        # (Nemotron 3 Nano Omni) is used for these turns.
         #
         # IMPORTANT: Vision turns use NO conversation history. Each vision question
         # is independent with only the current frame. Including history causes
         # silent failures on 2nd+ questions due to multiple images in context.
+        messages: list[MessageParam] | None = None
         if camera_mode and self.camera_image_b64:
             try:
                 messages = await self._prepare_vision_messages(text)
+                if messages is None:
+                    # The camera was closed while this turn was being prepared;
+                    # fall through to the plain text path (main brain) below.
+                    camera_mode = False
+                    messages = None
             except Exception as exc:
                 log.exception("Vision turn setup failed")
                 await self._send_raw(
@@ -1084,18 +1277,20 @@ class Connection:
                         "I couldn't use the camera just now, sir. Please try again."
                     )
                 return
-        elif self.current_speaker_name:
-            contextualized_prompt = (
-                f"{build_system_prompt()} The current user is {self.current_speaker_name}."
-            )
-            messages = build_messages(
-                self.history, text, max_history=settings.max_llm_history,
-                system_prompt=contextualized_prompt
-            )
-        else:
-            messages = build_messages(
-                self.history, text, max_history=settings.max_llm_history
-            )
+        if messages is None:
+            # Plain text turn (camera off, or camera closed mid-preparation).
+            if self.current_speaker_name:
+                contextualized_prompt = (
+                    f"{build_system_prompt()} The current user is {self.current_speaker_name}."
+                )
+                messages = build_messages(
+                    self.history, text, max_history=settings.max_llm_history,
+                    system_prompt=contextualized_prompt
+                )
+            else:
+                messages = build_messages(
+                    self.history, text, max_history=settings.max_llm_history
+                )
         # Keep the self-trimming container after build_messages returns a list.
         self.history = ConversationHistory(
             messages, max_history=settings.max_llm_history
@@ -1133,6 +1328,61 @@ class Connection:
             if settings.tts_auto_speak:
                 await self._start_tts(text)
 
+    async def _ensure_dashboard_running(self) -> bool:
+        """Start the React dashboard dev server if it is not already listening.
+
+        Shared by ``show_dashboard`` (opens a browser tab) and ``open_system``
+        (the HUD loads the same page in its embedded system window). Returns
+        True when ``_DASHBOARD_URL`` answers.
+        """
+        import shutil
+        import subprocess
+        import urllib.request
+
+        def reachable() -> bool:
+            try:
+                urllib.request.urlopen(_DASHBOARD_URL, timeout=1)
+                return True
+            except Exception:
+                return False
+
+        if await asyncio.to_thread(reachable):
+            return True
+
+        npm = shutil.which("npm") or shutil.which("npm.cmd")
+        if npm is None and os.name == "nt":
+            candidate = os.path.join(
+                os.environ.get("ProgramFiles", r"C:\Program Files"),
+                "nodejs",
+                "npm.cmd",
+            )
+            if os.path.isfile(candidate):
+                npm = candidate
+        if npm is None:
+            log.warning("dashboard requested but npm was not found")
+            return False
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        dash_dir = os.path.join(root, "alvin-ai-dashboard")
+        try:
+            subprocess.Popen(
+                [npm, "run", "dev", "--", "--port", "5173", "--host", "127.0.0.1"],
+                cwd=dash_dir,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            log.exception("failed to start the dashboard dev server")
+            return False
+
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            if await asyncio.to_thread(reachable):
+                return True
+            await asyncio.sleep(0.5)
+        log.warning("dashboard dev server did not come up within 15s")
+        return False
+
     async def _dispatch_command(self, match: IntentMatch) -> None:
         """Execute a deterministic device command without an LLM round-trip.
 
@@ -1163,58 +1413,88 @@ class Connection:
             if settings.wake_speak_ack and match.confirmation:
                 await self._start_tts(match.confirmation)
             return
+
+        if match.intent == "show_home":
+            # Bring the assistant's own UI back to the front. The HUD acts on
+            # the event by closing its pop-ups and raising the main window;
+            # a non-HUD mic client gets a fresh HUD launched instead.
+            await self._send_raw({
+                "type": "command",
+                "intent": "show_home",
+                "slots": {},
+                "raw": match.raw,
+                "normalized": match.normalized,
+                "action": "focus_hud",
+            })
+            if not self.is_hud_client:
+                await self._launch_hud()
+            return
+
+        if match.intent == "wake_up":
+            # Tell the client first. A HUD started hidden (``start.bat``) uses
+            # this event to reveal its window; only clients that are not the
+            # HUD need a brand-new HUD process spawned for them.
+            await self._send_raw({
+                "type": "command",
+                "intent": "wake_up",
+                "slots": {},
+                "raw": match.raw,
+                "normalized": match.normalized,
+                "wake_word": match.wake_word,
+            })
+            if not self.is_hud_client:
+                await self._launch_hud()
+            if match.confirmation:
+                await self._start_tts(match.confirmation)
+            return
         if match.intent == "show_dashboard":
-            import os
             import subprocess
             import webbrowser
+
+            running = await self._ensure_dashboard_running()
+
+            # Report the latest session topic from conversation history.
+            latest_user = None
+            for msg in reversed(self.history):
+                if msg.get("role") == "user":
+                    latest_user = msg.get("content", "")
+                    break
+            if latest_user:
+                await self._start_tts(f"Opening the dashboard sir. Your last session was about {latest_user}.")
+            else:
+                await self._start_tts("Opening the dashboard sir.")
+
+            # Try to bring to foreground on Windows
             try:
-                root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                dash_dir = os.path.join(root, "alvin-ai-dashboard")
-                url = "http://127.0.0.1:5173"
-                # Check if already running
-                import urllib.request
-                running = False
-                try:
-                    urllib.request.urlopen(url, timeout=1)
-                    running = True
-                except Exception:
-                    running = False
-
-                if not running:
-                    npm = "npm.cmd" if os.name == "nt" else "npm"
-                    for cand in [os.path.join(os.environ.get("ProgramFiles","C:\\Program Files"),"nodejs","npm.cmd"), "npm.cmd", "npm"]:
-                        if os.path.isfile(cand) if cand.endswith('.cmd') or cand.endswith('.exe') else False:
-                            npm = cand
-                            break
-                    subprocess.Popen([npm, "run", "dev", "--", "--port", "5173", "--host", "127.0.0.1"], cwd=dash_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    await asyncio.sleep(4)
-
-                # Report the latest session topic from conversation history.
-                latest_user = None
-                for msg in reversed(self.history):
-                    if msg.get("role") == "user":
-                        latest_user = msg.get("content", "")
-                        break
-                if latest_user:
-                    await self._start_tts(f"Opening the dashboard sir. Your last session was about {latest_user}.")
+                if os.name == "nt":
+                    subprocess.Popen(["cmd", "/c", "start", "", _DASHBOARD_URL], shell=False)
                 else:
-                    await self._start_tts("Opening the dashboard sir.")
-
-                # Try to bring to foreground on Windows
+                    webbrowser.open(_DASHBOARD_URL, new=1)
+            except Exception:
                 try:
-                    if os.name == "nt":
-                        subprocess.Popen(['cmd', '/c', 'start', '', url], shell=False)
-                    else:
-                        webbrowser.open(url, new=1)
+                    webbrowser.open(_DASHBOARD_URL)
                 except Exception:
-                    try:
-                        webbrowser.open(url)
-                    except Exception:
-                        pass
-                await self._send_raw({"type": "command", "intent": "show_dashboard", "slots": {}})
-            except Exception as e:
-                log.exception("Failed to start dashboard")
-                await self._start_tts("Could not open dashboard.")
+                    pass
+            await self._send_raw({
+                "type": "command",
+                "intent": "show_dashboard",
+                "slots": {"dashboard_ready": running},
+            })
+            return
+
+        if match.intent == "open_system":
+            # The HUD opens its embedded system window on this event. The
+            # dashboard dev server must be listening before the page can load,
+            # so make sure it is up and report the result in the slots.
+            await self._start_tts(match.confirmation or "Opening system settings, sir.")
+            running = await self._ensure_dashboard_running()
+            if not running:
+                log.warning("open_system: dashboard dev server is not reachable")
+            await self._send_raw({
+                "type": "command",
+                "intent": "open_system",
+                "slots": {"dashboard_ready": running},
+            })
             return
 
         if match.intent == "open_vs_code":
@@ -1256,6 +1536,10 @@ class Connection:
             await self._start_tts(f"It is {now}.")
             return
 
+        if match.intent == "shutdown_laptop":
+            await self._dispatch_laptop_shutdown(match)
+            return
+
         if match.intent == "shutdown":
             # Signal the client to remove the frontend, speak the
             # acknowledgement, and schedule the server to shut down AFTER the
@@ -1286,15 +1570,22 @@ class Connection:
         elif match.intent == "unmute_mic":
             self.is_muted = False
 
-        # Only close a browser tab when the stop is actually about music/YouTube;
-        # a bare "stop" / "stop it" keeps its existing command-event behavior.
+        # Only close a browser tab when the stop is actually about music/YouTube
+        # and the HUD is not playing a direct stream locally; a bare "stop" /
+        # "stop it" keeps its existing command-event behavior.
         closed_youtube_tab = False
-        if match.intent == "stop" and is_youtube_music_stop(match.raw):
+        if (
+            match.intent == "stop"
+            and is_youtube_music_stop(match.raw)
+            and not self.youtube_local_playback
+        ):
             try:
                 closed_youtube_tab = await asyncio.to_thread(close_youtube_tab)
             except Exception as exc:
                 log.warning("close_youtube_tab failed: %s", exc)
                 closed_youtube_tab = False
+        if match.intent == "stop":
+            self.youtube_local_playback = False
 
         speak = match.confirmation and (
             settings.intent_speak_confirmation or match.intent in ALWAYS_CONFIRM_INTENTS
@@ -1320,6 +1611,41 @@ class Connection:
         if speak:
             await self._start_tts(match.confirmation)
 
+    async def _launch_hud(self) -> None:
+        """Launch the PySide6 Holographic UI when the user says 'wake up'."""
+        try:
+            import subprocess
+            import sys
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            hud_script = os.path.join(root, "alvin_hud.py")
+            if os.path.isfile(hud_script):
+                subprocess.Popen([sys.executable, hud_script], cwd=root)
+                log.info("Launched holographic UI")
+        except Exception:
+            log.exception("Failed to launch holographic UI")
+
+    async def _dispatch_laptop_shutdown(self, match: IntentMatch) -> None:
+        """Speak the acknowledgement, then power off the local machine."""
+        await self._cancel_ongoing_turn(send_tts_stop=True)
+        await self._send_raw({
+            "type": "command",
+            "intent": "shutdown_laptop",
+            "slots": {},
+            "raw": match.raw,
+            "normalized": match.normalized,
+            "action": "laptop_shutdown",
+        })
+        await self._start_tts(match.confirmation)
+        # Let the spoken goodbye reach the speakers before the OS starts its
+        # own shutdown countdown, otherwise the audio is cut mid-sentence.
+        if self.tts_task is not None:
+            try:
+                await self.tts_task
+            except Exception:
+                log.exception("laptop shutdown TTS failed")
+        log.warning("laptop shutdown: powering off the local machine")
+        _request_laptop_shutdown(settings.laptop_shutdown_delay_sec)
+
     async def _dispatch_open_camera(self, match: IntentMatch) -> None:
         """Tell the client to open its camera popup; speak confirmation."""
         await self._cancel_ongoing_turn(send_tts_stop=True)
@@ -1344,20 +1670,7 @@ class Connection:
         """Release the camera and close the client-side camera popup."""
         await self._cancel_ongoing_turn(send_tts_stop=True)
         try:
-            self.camera_active = False
-            self.camera_image_b64 = None
-            if self.camera_image_path and os.path.isfile(self.camera_image_path):
-                try:
-                    os.remove(self.camera_image_path)
-                except OSError:
-                    pass
-                self.camera_image_path = None
-            if self._camera is not None:
-                try:
-                    self._camera.release()
-                except Exception:
-                    pass
-                self._camera = None
+            self._close_camera_state()
 
             await self._send_raw(
                 {
@@ -1569,6 +1882,14 @@ class Connection:
         else:
             await self._start_tts(f"Done sir, I could not find {query} on YouTube.")
 
+        # Resolve a direct (ad-free) stream while the confirmation is playing.
+        # Only the HUD can use it; browser/dashboard clients get the watch URL.
+        stream_url = None
+        if yt and settings.youtube_adfree and self.is_hud_client:
+            stream_url = await resolve_stream_url(
+                yt.video_id, audio_only=settings.youtube_audio_only
+            )
+
         event: dict = {
             "type": "command",
             "intent": "play_youtube",
@@ -1577,6 +1898,8 @@ class Connection:
                 "video_id": yt.video_id if yt else None,
                 "title": yt.title if yt else None,
                 "url": yt.url if yt else fallback_search_url(query),
+                "stream_url": stream_url,
+                "audio_only": settings.youtube_audio_only,
                 "resolved": bool(yt),
                 "target": "alvin_youtube_player",
             },
@@ -1999,6 +2322,20 @@ class Connection:
                     if not await self._send_bytes(item):
                         log.debug("client disconnected during TTS; stopping synthesis")
                         return
+        except asyncio.CancelledError:
+            # Barge-in / stop: the canceller sends tts_stop, and no tts_end
+            # should follow a cancelled turn.
+            raise
+        except Exception as exc:
+            # Never leave clients stuck in their "speaking" state: report the
+            # failure and still emit tts_end below.
+            log.exception("TTS stream failed")
+            event = {"type": "tts_error", "error": str(exc)}
+            errors.append(event)
+            try:
+                await self._send_raw(event)
+            except Exception:
+                pass
         finally:
             self.echo.end_speech()
 

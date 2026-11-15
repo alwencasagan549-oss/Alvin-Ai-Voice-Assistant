@@ -35,6 +35,7 @@ const INTENT_DETAILS = {
   play_youtube: ['YouTube playback via yt-dlp', 'globe'],
   query_time: ['Time query · local command', 'clock'],
   show_dashboard: ['Open the dashboard UI', 'monitor'],
+  open_system: ['Open the system settings window', 'settings'],
   shutdown: ['Server shutdown · "goodbye"', 'power'],
 };
 
@@ -149,7 +150,9 @@ export default function App() {
   const alvin = useAlvin();
   const { cameraStream, sendCameraFrame } = alvin;
   const [activeNav, setActiveNav] = useState('Dashboard');
-  const [showSettings, setShowSettings] = useState(false);
+  // The HUD opens the dashboard with #settings so the embedded system window
+  // lands directly on the settings panel.
+  const [showSettings, setShowSettings] = useState(() => window.location.hash === '#settings');
   const [confirmDisconnect, setConfirmDisconnect] = useState(false);
   const [now, setNow] = useState(new Date());
   const messageListRef = useRef(null);
@@ -235,6 +238,9 @@ export default function App() {
     }
 
     const captureAndSend = () => {
+      // A close is in progress: no further frames, so the server never
+      // re-arms camera mode with a frame captured after camera_close.
+      if (alvin.cameraClosingRef?.current) return;
       const video = cameraVideoRef.current;
       if (!video) return;
       if (video.readyState < 2) return;

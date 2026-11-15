@@ -113,6 +113,148 @@ def test_set_volume_carries_the_slot(monkeypatch: pytest.MonkeyPatch) -> None:
     assert commands[0]["slots"] == {"volume": 40}
 
 
+def test_hud_client_announces_itself_in_the_config_frame() -> None:
+    _ws, conn = _connection()
+    assert conn.is_hud_client is False
+    asyncio.run(conn._on_text(json.dumps({"type": "config", "client": "hud"})))
+    assert conn.is_hud_client is True
+
+    _ws2, conn2 = _connection()
+    asyncio.run(conn2._on_text(json.dumps({"type": "config", "language": "en"})))
+    assert conn2.is_hud_client is False
+
+
+def test_show_home_focuses_the_hud_without_speech(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """'go back to homepage' focuses the HUD; it needs no spoken reply."""
+    _disable_llm(monkeypatch)
+    ws, conn = _connection()
+    conn.is_hud_client = True
+    launched: list[bool] = []
+    spoken: list[str] = []
+
+    async def fake_launch() -> None:
+        launched.append(True)
+
+    async def fake_tts(text) -> None:
+        spoken.append(text)
+
+    monkeypatch.setattr(conn, "_launch_hud", fake_launch)
+    monkeypatch.setattr(conn, "_start_tts", fake_tts)
+
+    asyncio.run(conn._handle_final_utterance("go back to homepage", 0.95))
+
+    commands = [event for event in ws.json if event.get("type") == "command"]
+    assert commands and commands[0]["intent"] == "show_home"
+    assert commands[0]["action"] == "focus_hud"
+    assert launched == []
+    assert spoken == []
+
+
+def test_show_home_launches_the_hud_for_a_non_hud_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disable_llm(monkeypatch)
+    ws, conn = _connection()
+    conn.is_hud_client = False
+    launched: list[bool] = []
+
+    async def fake_launch() -> None:
+        launched.append(True)
+
+    async def fake_tts(_text) -> None:
+        return None
+
+    monkeypatch.setattr(conn, "_launch_hud", fake_launch)
+    monkeypatch.setattr(conn, "_start_tts", fake_tts)
+
+    asyncio.run(conn._handle_final_utterance("alvin go home", 0.95))
+
+    commands = [event for event in ws.json if event.get("type") == "command"]
+    assert commands and commands[0]["intent"] == "show_home"
+    assert launched == [True]
+
+
+def test_wake_up_reveals_the_hud_client_without_spawning_another(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hidden HUD hears "wake up" itself: reveal, do not launch a duplicate."""
+    _disable_llm(monkeypatch)
+    ws, conn = _connection()
+    conn.is_hud_client = True
+    launched: list[bool] = []
+
+    async def fake_launch() -> None:
+        launched.append(True)
+
+    async def fake_tts(_text) -> None:
+        return None
+
+    monkeypatch.setattr(conn, "_launch_hud", fake_launch)
+    monkeypatch.setattr(conn, "_start_tts", fake_tts)
+
+    asyncio.run(conn._handle_final_utterance("alvin wake up", 0.95))
+
+    commands = [event for event in ws.json if event.get("type") == "command"]
+    assert commands and commands[0]["intent"] == "wake_up"
+    assert launched == [], "the HUD's own socket must not spawn a second HUD"
+
+
+def test_wake_up_launches_the_hud_for_a_non_hud_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disable_llm(monkeypatch)
+    ws, conn = _connection()
+    conn.is_hud_client = False
+    launched: list[bool] = []
+
+    async def fake_launch() -> None:
+        launched.append(True)
+
+    async def fake_tts(_text) -> None:
+        return None
+
+    monkeypatch.setattr(conn, "_launch_hud", fake_launch)
+    monkeypatch.setattr(conn, "_start_tts", fake_tts)
+
+    asyncio.run(conn._handle_final_utterance("alvin wake up", 0.95))
+
+    commands = [event for event in ws.json if event.get("type") == "command"]
+    assert commands and commands[0]["intent"] == "wake_up"
+    assert launched == [True]
+
+
+def test_laptop_shutdown_powers_off_the_machine_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """'turn off my laptop' powers off the OS, not the AI server process."""
+    _disable_llm(monkeypatch)
+    ws, conn = _connection()
+    os_calls: list[float] = []
+    server_stops: list[bool] = []
+
+    async def fake_tts(_text) -> None:
+        return None
+
+    monkeypatch.setattr(conn, "_start_tts", fake_tts)
+    monkeypatch.setattr(conn, "_schedule_shutdown", lambda: server_stops.append(True))
+    monkeypatch.setattr(
+        connection_mod,
+        "_request_laptop_shutdown",
+        lambda delay: os_calls.append(delay),
+    )
+    monkeypatch.setattr(settings, "laptop_shutdown_delay_sec", 10.0)
+
+    asyncio.run(conn._handle_final_utterance("alvin turn off my laptop", 0.95))
+
+    commands = [event for event in ws.json if event.get("type") == "command"]
+    assert commands and commands[0]["intent"] == "shutdown_laptop"
+    assert commands[0]["action"] == "laptop_shutdown"
+    assert os_calls == [10.0], "the OS shutdown command must be invoked"
+    assert server_stops == [], "the AI-server shutdown must not be involved"
+
+
 def test_stop_cancels_in_progress_turn(monkeypatch: pytest.MonkeyPatch) -> None:
     _disable_llm(monkeypatch)
     monkeypatch.setattr(settings, "intent_speak_confirmation", False)
@@ -134,12 +276,76 @@ def test_stop_cancels_in_progress_turn(monkeypatch: pytest.MonkeyPatch) -> None:
     assert task.cancelled(), "an in-progress turn must be aborted by 'stop'"
 
 
+def test_stop_the_music_closes_youtube_and_emits_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disable_llm(monkeypatch)
+    monkeypatch.setattr(settings, "intent_speak_confirmation", False)
+    closed: list[bool] = []
+
+    def fake_close() -> bool:
+        closed.append(True)
+        return True
+
+    monkeypatch.setattr(connection_mod, "close_youtube_tab", fake_close)
+    ws, conn = _connection()
+
+    asyncio.run(conn._handle_final_utterance("stop the music", 0.95))
+
+    commands = [event for event in ws.json if event.get("type") == "command"]
+    assert commands and commands[0]["intent"] == "stop"
+    assert commands[0]["closed_youtube_tab"] is True
+    assert closed == [True], "the YouTube tab/player must be asked to close"
+
+
+def test_youtube_playback_state_is_tracked() -> None:
+    _ws, conn = _connection()
+
+    asyncio.run(conn._on_text(json.dumps({"type": "youtube_playback", "local": True})))
+    assert conn.youtube_local_playback is True
+
+    asyncio.run(conn._on_text(json.dumps({"type": "youtube_playback", "local": False})))
+    assert conn.youtube_local_playback is False
+
+
+def test_stop_music_does_not_focus_browser_for_local_playback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disable_llm(monkeypatch)
+    monkeypatch.setattr(settings, "intent_speak_confirmation", False)
+    closed: list[bool] = []
+
+    def fake_close() -> bool:
+        closed.append(True)
+        return True
+
+    monkeypatch.setattr(connection_mod, "close_youtube_tab", fake_close)
+    ws, conn = _connection()
+    conn.youtube_local_playback = True
+
+    asyncio.run(conn._handle_final_utterance("stop the music", 0.95))
+
+    commands = [event for event in ws.json if event.get("type") == "command"]
+    assert commands and commands[0]["intent"] == "stop"
+    assert commands[0]["closed_youtube_tab"] is False
+    assert closed == [], "local playback must not focus the browser"
+    assert conn.youtube_local_playback is False
+
+
 def test_open_ended_utterance_reaches_the_llm(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "intent_speak_confirmation", False)
     seen: list[object] = []
 
     async def fake_stream(
-        messages, *, max_tokens=None, temperature=None, fallback_text=None, tools=None, tool_choice=None
+        messages,
+        *,
+        max_tokens=None,
+        temperature=None,
+        fallback_text=None,
+        tools=None,
+        tool_choice=None,
+        camera_mode=False,
+        model_override=None,
     ):
         seen.append(messages)
         yield ("Sure. I will check the weather for you.", "fake-model")
@@ -171,7 +377,15 @@ def test_web_search_call_sends_fixed_acknowledgement(
 ) -> None:
     """A real web-search tool call is announced before its answer."""
     async def fake_stream(
-        messages, *, max_tokens=None, temperature=None, fallback_text=None, tools=None, tool_choice=None
+        messages,
+        *,
+        max_tokens=None,
+        temperature=None,
+        fallback_text=None,
+        tools=None,
+        tool_choice=None,
+        camera_mode=False,
+        model_override=None,
     ):
         yield (None, "tool_call:web_search")
         yield ("Here is the information you requested.", "fake-model")
@@ -205,7 +419,15 @@ def test_low_confidence_transcript_falls_back_to_the_llm(
     seen: list[object] = []
 
     async def fake_stream(
-        messages, *, max_tokens=None, temperature=None, fallback_text=None, tools=None, tool_choice=None
+        messages,
+        *,
+        max_tokens=None,
+        temperature=None,
+        fallback_text=None,
+        tools=None,
+        tool_choice=None,
+        camera_mode=False,
+        model_override=None,
     ):
         seen.append(messages)
         yield ("Sure.", "fake-model")

@@ -1,13 +1,14 @@
-"""Run the Alvin backend and optionally the dashboard frontend.
+"""Run the Alvin backend and optionally the holographic UI.
 
 Usage:
-    python run-all.py              # backend only (port 8000) - dashboard on demand
-    python run-all.py --frontend   # backend + frontend (ports 8000 + 5173) always on
+    python run-all.py              # backend only (port 8000)
+    python run-all.py --hud       # backend + holographic UI
+    python run-all.py --hud --hidden  # HUD starts hidden, appears on "Alvin, wake up"
     python run-all.py --mic       # backend + mic client
 
 This starts:
   1. The FastAPI STT/TTS/LLM backend on http://localhost:8000
-  2. Optional: React + Vite dashboard on http://localhost:5173
+  2. Optional: PySide6 Holographic UI (launched on --hud or by "Alvin, wake up")
   3. Optional: Local mic client (run.py --mic)
 
 Press Ctrl+C to stop all servers cleanly.
@@ -23,100 +24,52 @@ import sys
 import time
 import urllib.request
 import json
+import socket
 
 from app.config import settings
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-DASHBOARD_DIR = os.path.join(ROOT, "alvin-ai-dashboard")
 # Bug 28: mirror run.py's TTS_AUTO_SPEAK guard so the combined launcher never
 # overrides a caller that has intentionally disabled auto-speak.
 if os.environ.get("TTS_AUTO_SPEAK", "").lower() not in {"true", "1", "yes", "on"}:
     os.environ["TTS_AUTO_SPEAK"] = "true"
 BACKEND_PORT = 8000
-FRONTEND_PORT = 5173
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Alvin backend and optional frontend")
+    parser = argparse.ArgumentParser(description="Run Alvin backend and optional holographic UI")
     parser.add_argument(
-        "--frontend",
+        "--hud",
         action="store_true",
-        help="Start the React/Vite frontend dashboard automatically (otherwise start on demand via voice)",
+        help="Start the PySide6 Holographic UI immediately (otherwise it starts on 'Alvin, wake up')",
+    )
+    parser.add_argument(
+        "--hidden",
+        action="store_true",
+        help=(
+            "Start the HUD hidden; it appears when the user says 'Alvin, wake up' "
+            "(requires --hud)"
+        ),
     )
     parser.add_argument(
         "--mic",
         action="store_true",
-        help="Also start the local mic client (run.py --mic)",
+        help="Also start the local mic client",
     )
     return parser.parse_args()
 
 
-def _ports_are_available(backend_host: str, frontend_host: str) -> bool:
-    """Refuse occupied ports instead of terminating processes we do not own."""
-    import socket
-
-    for port, host, label in (
-        (BACKEND_PORT, backend_host, "backend"),
-        (FRONTEND_PORT, frontend_host, "frontend"),
-    ):
-        try:
-            addresses = socket.getaddrinfo(
-                host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
-            )
-        except OSError:
-            _print_err(f"Cannot resolve bind host {host!r} for the {label}.")
-            return False
-        available = False
-        for family, socktype, proto, _, address in addresses:
-            test_sock = socket.socket(family, socktype, proto)
-            try:
-                test_sock.bind(address)
-                available = True
-                break
-            except OSError:
-                continue
-            finally:
-                test_sock.close()
-        if not available:
-            _print_err(f"Port {port} ({label}) is already in use; close its owner and retry.")
-            return False
-    return True
-
-
-def _stop_process_tree(proc: subprocess.Popen | None) -> None:
-    """Stop only a child process tree started by this launcher."""
-    if proc is None or proc.poll() is not None:
-        return
-    try:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                capture_output=True,
-                timeout=5,
-            )
-        else:
-            os.killpg(proc.pid, signal.SIGTERM)
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                capture_output=True,
-                timeout=5,
-            )
-        else:
-            os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait(timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        pass
+def _find_python() -> str:
+    venv_python = os.path.join(ROOT, ".venv", "Scripts", "python.exe")
+    if os.path.isfile(venv_python):
+        return venv_python
+    venv_python_unix = os.path.join(ROOT, ".venv", "bin", "python")
+    if os.path.isfile(venv_python_unix):
+        return venv_python_unix
+    return sys.executable
 
 
 def _wait_for_url(url: str, timeout: float = 60, label: str = "service", require_ready: bool = False) -> bool:
-    """Wait until an HTTP endpoint responds, polling every 0.5s.
-
-    When ``require_ready`` is True, the endpoint must return a JSON body with
-    ``ready`` set to true (used for the backend's ``/health`` endpoint).
-    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -138,77 +91,23 @@ def _wait_for_url(url: str, timeout: float = 60, label: str = "service", require
     return False
 
 
-def _url_host(host: str, *, health_probe: bool = False) -> str:
-    """Format a bind address for a local HTTP health check or display URL."""
-    if health_probe and host in {"0.0.0.0", ""}:
-        host = "127.0.0.1"
-    elif health_probe and host == "::":
-        host = "::1"
-    if ":" in host and not host.startswith("["):
-        return f"[{host}]"
-    return host
-
-
-def _find_npm() -> str:
-    """Find npm executable path."""
-    # Check common Windows locations
-    candidates = [
-        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "nodejs", "npm.cmd"),
-        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "nodejs", "npm.cmd"),
-        r"C:\Program Files\nodejs\npm.cmd",
-        r"C:\Program Files (x86)\nodejs\npm.cmd",
-    ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    # Fall back to PATH lookup
-    return "npm"
-
-
-def _find_python() -> str:
-    """Find Python executable path, preferring the venv."""
-    venv_python = os.path.join(ROOT, ".venv", "Scripts", "python.exe")
-    if os.path.isfile(venv_python):
-        return venv_python
-    # Try venv/bin for Unix-like
-    venv_python = os.path.join(ROOT, ".venv", "bin", "python")
-    if os.path.isfile(venv_python):
-        return venv_python
-    return sys.executable
-
-
-def _print_ok(msg: str) -> None:
-    """Print a success message without Unicode characters for Windows compat."""
-    print(f"  [OK] {msg}", flush=True)
-
-
-def _print_err(msg: str) -> None:
-    """Print an error message without Unicode characters."""
-    print(f"  [ERROR] {msg}", flush=True)
-
-
-def _ensure_frontend_deps() -> None:
-    """Run npm install if node_modules is missing."""
-    node_modules = os.path.join(DASHBOARD_DIR, "node_modules")
-    if not os.path.isdir(node_modules):
-        print("Installing frontend dependencies (npm install)...", flush=True)
-        npm_cmd = _find_npm()
-        result = subprocess.run(
-            [npm_cmd, "install"],
-            cwd=DASHBOARD_DIR,
-            stdout=sys.stdout,
-            stderr=sys.stderr,
+def _ensure_pyside6() -> bool:
+    """Check if PySide6 is installed, return True if available."""
+    try:
+        subprocess.run(
+            [_find_python(), "-c", "import PySide6"],
+            check=True,
+            capture_output=True,
         )
-        if result.returncode != 0:
-            _print_err("npm install failed")
-            sys.exit(1)
-        _print_ok("Frontend dependencies installed")
+        return True
+    except subprocess.CalledProcessError:
+        return False
 
 
 def main() -> None:
     args = parse_args()
     backend_proc = None
-    frontend_proc = None
+    hud_proc = None
     mic_proc = None
     cleanup_started = False
 
@@ -218,9 +117,28 @@ def main() -> None:
             raise SystemExit(exit_code)
         cleanup_started = True
         print("\n\nShutting down servers...", flush=True)
-        _stop_process_tree(mic_proc)
-        _stop_process_tree(frontend_proc)
-        _stop_process_tree(backend_proc)
+        if mic_proc and mic_proc.poll() is None:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(mic_proc.pid), "/T", "/F"], capture_output=True)
+            else:
+                try:
+                    os.killpg(mic_proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        if hud_proc and hud_proc.poll() is None:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(hud_proc.pid), "/T", "/F"], capture_output=True)
+            else:
+                try:
+                    os.killpg(hud_proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        if backend_proc and backend_proc.poll() is None:
+            backend_proc.terminate()
+            try:
+                backend_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                backend_proc.kill()
         print("Done.", flush=True)
         raise SystemExit(exit_code)
 
@@ -228,19 +146,20 @@ def main() -> None:
     signal.signal(signal.SIGTERM, cleanup)
 
     bind_host = settings.host
-    # Keep the browser app loopback-only: VITE_API_KEY is shipped to the page
-    # when configured and must not be exposed to other machines on the LAN.
-    frontend_host = "127.0.0.1"
-    exposed_hosts = {bind_host} - {"127.0.0.1", "localhost", "::1"}
-    if exposed_hosts and not settings.api_key:
-        _print_err(
-            "A non-loopback bind host requires API_KEY. Set a key or bind to 127.0.0.1."
-        )
-        raise SystemExit(1)
-    if not _ports_are_available(bind_host, frontend_host):
-        raise SystemExit(1)
+    if bind_host in ("0.0.0.0", ""):
+        bind_host = "127.0.0.1"
+    if bind_host == "::":
+        bind_host = "::1"
 
-    # ---- Start backend ----
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((bind_host, BACKEND_PORT))
+    except OSError:
+        print(f"ERROR: Port {BACKEND_PORT} is already in use", flush=True)
+        sys.exit(1)
+    sock.close()
+
     print("\n" + "=" * 60, flush=True)
     print("Starting Alvin backend (FastAPI STT/TTS/LLM)...", flush=True)
     print("=" * 60, flush=True)
@@ -259,86 +178,104 @@ def main() -> None:
         **child_group,
     )
 
-    # Wait for backend health
-    health_url = f"http://{_url_host(bind_host, health_probe=True)}:{BACKEND_PORT}/health"
+    health_url = f"http://127.0.0.1:{BACKEND_PORT}/health"
     if not _wait_for_url(health_url, timeout=120, label="backend", require_ready=True):
-        _print_err("Backend failed to start. Check the error messages above.")
-        cleanup(exit_code=1)
-    _print_ok(f"Backend ready at http://localhost:{BACKEND_PORT}")
+        print("ERROR: Backend failed to start. Check the error messages above.", flush=True)
+        cleanup()
+    print(f"  [OK] Backend ready at http://localhost:{BACKEND_PORT}", flush=True)
 
-    # ---- Start frontend (optional) ----
-    if args.frontend:
-        # Install frontend deps if needed (only on first run)
-        _ensure_frontend_deps()
+    if args.hud:
+        if not _ensure_pyside6():
+            print("\n" + "=" * 60, flush=True)
+            print("Installing PySide6 and dependencies...", flush=True)
+            print("=" * 60, flush=True)
+            result = subprocess.run(
+                [_find_python(), "-m", "pip", "install", "PySide6", "sounddevice", "websockets"],
+                cwd=ROOT,
+                stdout=sys.stdout,
+                stderr=sys.stderr,
+            )
+            if result.returncode != 0:
+                print("  [ERROR] Failed to install PySide6", flush=True)
+                print("  Run manually: pip install PySide6 sounddevice websockets", flush=True)
+            else:
+                print("  [OK] Dependencies installed", flush=True)
 
-        print("\n" + "=" * 60, flush=True)
-        print("Starting Alvin dashboard (React + Vite)...", flush=True)
-        print("=" * 60, flush=True)
-        npm_cmd = _find_npm()
-        frontend_proc = subprocess.Popen(
-            [npm_cmd, "run", "dev", "--", "--port", str(FRONTEND_PORT), "--host", frontend_host],
-            cwd=DASHBOARD_DIR,
-            stdout=sys.stdout,
-            stderr=sys.stderr,
-            **child_group,
-        )
+        if _ensure_pyside6():
+            print("\n" + "=" * 60, flush=True)
+            print("Launching Holographic UI...", flush=True)
+            print("=" * 60, flush=True)
+            hud_cmd = [_find_python(), "alvin_hud.py"]
+            if args.hidden:
+                hud_cmd.append("--hidden")
+            hud_proc = subprocess.Popen(
+                hud_cmd,
+                cwd=ROOT,
+                stdout=sys.stdout,
+                stderr=sys.stderr,
+                **child_group,
+            )
+            time.sleep(1)
+            if hud_proc.poll() is None:
+                state = "hidden (say 'Alvin, wake up')" if args.hidden else "ready"
+                print(f"  [OK] Holographic UI {state}", flush=True)
+            else:
+                print("  [ERROR] Holographic UI failed to start", flush=True)
+        else:
+            print("\n  [ERROR] Cannot launch Holographic UI - PySide6 not available", flush=True)
 
-        # Wait for frontend
-        frontend_url = f"http://{_url_host(frontend_host, health_probe=True)}:{FRONTEND_PORT}"
-        if not _wait_for_url(frontend_url, timeout=30, label="frontend"):
-            _print_err("Frontend failed to start. Check the error messages above.")
-            cleanup(exit_code=1)
-        _print_ok(f"Frontend ready at {frontend_url}")
-    else:
-        print("\n[NOTE] Backend only. Dashboard starts on demand when you say 'Alvin, open your dashboard'.", flush=True)
-
-    # ---- Start mic client (optional) ----
     if args.mic:
         print("\n" + "=" * 60, flush=True)
-        print("Starting local mic client (run.py --mic)...", flush=True)
+        print("Starting local mic client...", flush=True)
         print("=" * 60, flush=True)
         mic_proc = subprocess.Popen(
-            [_find_python(), "run.py", "--mic"],
+            [_find_python(), "-c", 
+             "import sys; import asyncio; "
+             "sys.path.insert(0, '.'); "
+             "from tests.manual.stream_mic import stream_mic; "
+             "asyncio.run(stream_mic('ws://127.0.0.1:8000/ws/transcribe'))"],
             cwd=ROOT,
             stdout=sys.stdout,
             stderr=sys.stderr,
             **child_group,
         )
         time.sleep(2)
-        _print_ok("Mic client started")
+        if mic_proc.poll() is None:
+            print("  [OK] Mic client started", flush=True)
+        else:
+            print("  [ERROR] Mic client failed to start", flush=True)
 
     print("\n" + "=" * 60, flush=True)
     print("ALL SERVERS RUNNING", flush=True)
     print(f"  Backend : {health_url}", flush=True)
-    if args.frontend:
-        frontend_url = f"http://{_url_host(frontend_host, health_probe=True)}:{FRONTEND_PORT}"
-        print(f"  Frontend: {frontend_url}", flush=True)
+    if args.hud and args.hidden:
+        print("  HUD     : HIDDEN (say 'Alvin, wake up')", flush=True)
+    elif args.hud:
+        print("  HUD     : ON (PySide6 Holographic UI)", flush=True)
     else:
-        print("  Frontend: ON DEMAND (say 'Alvin, open your dashboard')", flush=True)
+        print("  HUD     : ON DEMAND (say 'Alvin, wake up')", flush=True)
     if args.mic:
-        print("  Mic      : ON (run.py --mic)", flush=True)
+        print("  Mic     : ON", flush=True)
     else:
-        print("  Mic      : OFF (use --mic)", flush=True)
+        print("  Mic     : OFF (use --mic)", flush=True)
     print("  Press Ctrl+C to stop.", flush=True)
     print("=" * 60, flush=True)
 
-    # Keep the parent process alive until interrupted
     try:
         while True:
-            # Check if either process died unexpectedly
             if backend_proc.poll() is not None:
-                _print_err("Backend exited unexpectedly!")
+                print("ERROR: Backend exited unexpectedly!", flush=True)
                 break
-            if frontend_proc is not None and frontend_proc.poll() is not None:
-                _print_err("Frontend exited unexpectedly!")
+            if hud_proc and hud_proc.poll() is not None and args.hud:
+                print("ERROR: Holographic UI exited unexpectedly!", flush=True)
                 break
-            if mic_proc is not None and mic_proc.poll() is not None:
-                _print_err("Mic client exited unexpectedly!")
+            if mic_proc and mic_proc.poll() is not None and args.mic:
+                print("ERROR: Mic client exited unexpectedly!", flush=True)
                 break
             time.sleep(1)
     except KeyboardInterrupt:
-        cleanup()
-    cleanup(exit_code=1)
+        pass
+    cleanup()
 
 
 if __name__ == "__main__":

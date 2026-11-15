@@ -44,6 +44,7 @@ import miniaudio
 import numpy as np
 from piper import PiperVoice
 
+from .audio_pool import run_in_media_pool
 from .config import settings
 
 log = logging.getLogger("alvin.tts")
@@ -358,8 +359,8 @@ class PiperTTS:
 
         An async generator so the module-level :func:`synthesize_stream` fallback
         path (``async for pcm in piper_tts.synthesize_stream(...)``) works. Each
-        sentence is synthesized in a worker thread via ``asyncio.to_thread`` so
-        the CPU-bound Piper inference and resampling do not block the event loop.
+        sentence is synthesized on the bounded audio pool so the CPU-bound Piper
+        inference and resampling do not block the event loop.
         """
         if not self._load() or self._voice is None:
             return
@@ -367,7 +368,7 @@ class PiperTTS:
         sentences = chunk_sentences(text)
         gap = silence_gap_bytes(settings.tts_sentence_gap_ms)
         for index, sentence in enumerate(sentences):
-            pcm = await asyncio.to_thread(self.synthesize_pcm, sentence)
+            pcm = await run_in_media_pool(self.synthesize_pcm, sentence)
             if pcm:
                 yield pcm
             if index + 1 < len(sentences) and gap:
@@ -423,7 +424,7 @@ class _PcmAssembler:
             return b""
         data = bytes(self._buffer)
         self._decoded_bytes = len(data)
-        frames = await asyncio.to_thread(_decode_mp3, data)
+        frames = await run_in_media_pool(_decode_mp3, data)
         fresh = frames[self._emitted_samples :]
         if fresh.size == 0:
             return b""

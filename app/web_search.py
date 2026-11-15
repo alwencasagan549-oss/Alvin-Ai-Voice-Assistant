@@ -175,6 +175,54 @@ async def _gemini_search(
     return results, answer or None
 
 
+# ── Tavily primary ───────────────────────────────────────────────────────
+
+_TAVILY_URL = "https://api.tavily.com/search"
+
+
+async def _tavily_search(
+    query: str, topic: str, max_results: int, api_key: str
+) -> tuple[list[SearchResult], str | None]:
+    """Run a Tavily search. Returns ``(results, answer)``."""
+    import aiohttp
+
+    params = {
+        "query": query,
+        "topic": topic,
+        "max_results": max_results,
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                _TAVILY_URL,
+                json=params,
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=aiohttp.ClientTimeout(total=8.0),
+            ) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    log.warning("Tavily HTTP %d: %s", resp.status, text[:200])
+                    return [], None
+                data = await resp.json()
+    except Exception as exc:
+        log.warning("Tavily search failed: %s", exc)
+        return [], None
+
+    results: list[SearchResult] = []
+    for item in data.get("results", []):
+        results.append(SearchResult(
+            title=item.get("title", ""),
+            url=item.get("url", ""),
+            content=item.get("content", "") or item.get("snippet", ""),
+            domain=_extract_domain(item.get("url")),
+            published=item.get("published_date") or None,
+        ))
+
+    answer = data.get("answer")
+    return results, answer
+
+
 # ── DuckDuckGo fallback ───────────────────────────────────────────────────
 _ddg_cls = None
 _ddg_import_failed = False
@@ -306,6 +354,7 @@ async def web_search(
 ) -> str:
     """Search the web and return formatted plain text for the LLM.
 
+    Tavily is primary, DuckDuckGo is fallback.
     Never raises; on total failure returns a ``SEARCH_FAILED`` marker.
     """
     key = _cache_key(query, topic, max_results)
@@ -319,17 +368,17 @@ async def web_search(
     results: list[SearchResult] = []
     answer: str | None = None
 
-    # Run Gemini CLI and DuckDuckGo concurrently; take whichever returns
-    # usable results first. This avoids waiting 8s for a missing/slow Gemini
-    # CLI before DuckDuckGo even starts.
-    gemini_task: asyncio.Task | None = None
+    # Run Tavily and DuckDuckGo concurrently; take whichever returns
+    # usable results first. This avoids waiting for Tavily if DDG is faster.
+    tavily_task: asyncio.Task | None = None
     ddg_task: asyncio.Task | None = None
 
-    if _gemini_cli_path() is not None:
-        gemini_task = asyncio.create_task(_gemini_search(query, topic, max_results))
+    tavily_key = os.getenv("TAVILY_API_KEY") or os.getenv("GEMINI_API_KEY")
+    if tavily_key:
+        tavily_task = asyncio.create_task(_tavily_search(query, topic, max_results, tavily_key))
     ddg_task = asyncio.create_task(_duckduckgo_search(query, topic, max_results))
 
-    pending = {t for t in (gemini_task, ddg_task) if t is not None}
+    pending = {t for t in (tavily_task, ddg_task) if t is not None}
     if pending:
         done, _ = await asyncio.wait(
             pending, return_when=asyncio.FIRST_COMPLETED

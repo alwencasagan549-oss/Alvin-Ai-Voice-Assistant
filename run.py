@@ -100,12 +100,8 @@ def main() -> None:
 
     if args.mic:
         port = args.port or _free_port()
-        # Bug 11: only force TTS_AUTO_SPEAK on when it isn't already set to a
-        # truthy value in the caller's environment -- otherwise a deployment that
-        # has intentionally disabled auto-speak gets overridden here.
         if os.environ.get("TTS_AUTO_SPEAK", "").lower() not in {"true", "1", "yes", "on"}:
             os.environ["TTS_AUTO_SPEAK"] = "true"
-        # Propagate CLI args to the spawned server as environment variables
         if args.vad_threshold is not None:
             os.environ["VAD_THRESHOLD"] = str(vad_threshold)
         if args.voice:

@@ -74,6 +74,48 @@ def route(text: str, confidence: float | None = 0.95):
          # device query
          ("what time is it", "query_time", {}),
          ("what's the time", "query_time", {}),
+        # HUD reveal (start.bat starts the UI hidden)
+        ("wake up", "wake_up", {}),
+        ("alvin wake up", "wake_up", {}),
+        ("wake up now", "wake_up", {}),
+        ("alvin time to wake up", "wake_up", {}),
+        ("wake up alvin", "wake_up", {}),
+        ("I think you should wake up", "wake_up", {}),
+        # return to the assistant's main window
+        ("go back to homepage", "show_home", {}),
+        ("go back to the home page", "show_home", {}),
+        ("go home", "show_home", {}),
+        ("get me back home", "show_home", {}),
+        ("return to the home screen", "show_home", {}),
+        ("back to the homepage", "show_home", {}),
+        ("show homepage", "show_home", {}),
+        ("open the main window", "show_home", {}),
+        ("focus the app", "show_home", {}),
+        ("alvin go back to homepage", "show_home", {}),
+        # system settings window (dashboard embedded in the HUD)
+        ("open your system", "open_system", {}),
+        ("alvin open your system", "open_system", {}),
+        ("open system", "open_system", {}),
+        ("open system settings", "open_system", {}),
+        ("open the system settings", "open_system", {}),
+        ("open your settings", "open_system", {}),
+        ("show settings", "open_system", {}),
+        ("settings", "open_system", {}),
+        ("system settings", "open_system", {}),
+        ("open control panel", "open_system", {}),
+        # app launching still routes through open_apps
+        ("open chrome", "open_apps", {"app": "chrome"}),
+        ("alvin open notepad", "open_apps", {"app": "notepad"}),
+        # laptop power-off (OS shutdown, distinct from the AI server stop)
+        ("turn off my laptop", "shutdown_laptop", {}),
+        ("alvin turn off my laptop", "shutdown_laptop", {}),
+        ("alvin, please turn off my laptop", "shutdown_laptop", {}),
+        ("shut down my laptop", "shutdown_laptop", {}),
+        ("shut down the computer", "shutdown_laptop", {}),
+        ("shutdown my laptop", "shutdown_laptop", {}),
+        ("power off my laptop", "shutdown_laptop", {}),
+        ("turn my laptop off", "shutdown_laptop", {}),
+        ("turn off my laptop now", "shutdown_laptop", {}),
          # shutdown
          ("goodbye", "shutdown", {}),
          ("alvin goodbye", "shutdown", {}),
@@ -152,6 +194,13 @@ def test_stop_with_music_reference_flags_youtube_close() -> None:
         "tell me a joke",
         "what is the difference between volume and loudness",
         "set a timer for the pasta",
+        # laptop power-off must be a whole utterance, never embedded in prose
+        "turn off my laptop screen",
+        "how do I turn off my laptop",
+        "shut down my laptop after the movie",
+        # homepage focus must be a whole utterance too
+        "how do I go back to the homepage",
+        "go home later",
     ],
 )
 def test_conversational_utterance_is_not_a_command(utterance: str) -> None:
@@ -445,12 +494,55 @@ def test_shutdown_recognized(utterance: str) -> None:
 @pytest.mark.parametrize(
     "utterance",
     [
+        # "goodbye" anywhere in the sentence triggers shutdown, not just a
+        # whole-utterance "goodbye".
         "goodbye my friend",
         "okay goodbye i will call you later",
         "thank you alvin goodbye i appreciate it",
         "what time is it goodbye",
         "goodbye to you too",
+        "I think it is time to say goodbye",
+        "alvin I think we should say goodbye for now",
+        "well, good bye then",
     ],
 )
-def test_shutdown_not_triggered_conversationally(utterance: str) -> None:
-    assert route(utterance) is None, f"{utterance!r} must fall through to the LLM"
+def test_shutdown_triggered_by_goodbye_anywhere(utterance: str) -> None:
+    match = route(utterance)
+    assert match is not None, f"{utterance!r} should route to shutdown"
+    assert match.intent == "shutdown"
+    assert match.action == "shutdown"
+    assert match.confirmation == SHUTDOWN_RESPONSE_TEXT
+
+
+def test_goodbye_fallback_does_not_match_the_plural() -> None:
+    """Only the word "goodbye" -- "goodbyes" stays an LLM turn."""
+    assert route("goodbyes are always hard to say") is None
+
+
+def test_whole_utterance_command_wins_over_goodbye_fallback() -> None:
+    """A real command in the same sentence still executes (song named Goodbye)."""
+    match = route("play goodbye on youtube")
+    assert match is not None
+    assert match.intent == "play_youtube"
+    assert match.slots["query"].lower() == "goodbye"
+
+
+def test_home_phrase_does_not_hijack_youtube_playback() -> None:
+    """'play go home on youtube' is a song request, not a window focus."""
+    match = route("play go home on youtube")
+    assert match is not None
+    assert match.intent == "play_youtube"
+
+
+def test_goodbye_fallback_respects_allowed_subset() -> None:
+    """The muted-mode mic-control pass must not shut the assistant down."""
+    from app.intents import MIC_CONTROL_INTENTS
+
+    assert (
+        route_command(
+            "I think it is time to say goodbye",
+            0.95,
+            allowed=MIC_CONTROL_INTENTS,
+        )
+        is None
+    )

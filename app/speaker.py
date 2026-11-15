@@ -35,6 +35,7 @@ from typing import Optional
 
 import numpy as np
 
+from .audio_pool import run_in_media_pool
 from .config import settings
 
 log = logging.getLogger("alvin.speaker")
@@ -273,7 +274,7 @@ class SpeakerService:
             raise ValueError(f"Enrollment audio too long: {duration:.1f}s (maximum {_MAX_ENROLLMENT_SECONDS}s)")
 
         # Extract embedding
-        embedding = await asyncio.to_thread(self._model.extract_embedding, audio)
+        embedding = await run_in_media_pool(self._model.extract_embedding, audio)
 
         async with self._lock:
             if speaker_id and speaker_id in self.profiles:
@@ -312,7 +313,7 @@ class SpeakerService:
             )
 
         # Extract embedding from input audio
-        embedding = await asyncio.to_thread(self._model.extract_embedding, audio)
+        embedding = await run_in_media_pool(self._model.extract_embedding, audio)
 
         async with self._lock:
             profiles = [
@@ -338,7 +339,7 @@ class SpeakerService:
 
             return best_speaker_id, best_name, best_similarity
 
-        best_speaker_id, best_name, best_similarity = await asyncio.to_thread(
+        best_speaker_id, best_name, best_similarity = await run_in_media_pool(
             compare_profiles
         )
 

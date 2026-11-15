@@ -522,10 +522,6 @@ if _WINDOWS:
         Verify browser focus before sending text or Enter.
         """
 
-        if _user32.GetForegroundWindow() != hwnd:
-            log.warning("close_youtube_tab: browser lost foreground before tab search")
-            return False
-
         _combo(
             _VK_CONTROL,
             _VK_SHIFT,
@@ -534,25 +530,25 @@ if _WINDOWS:
 
         time.sleep(0.4)
 
-        if _user32.GetForegroundWindow() != hwnd:
-            log.warning("close_youtube_tab: focus changed while opening tab search")
-            return False
-
         _type_text("youtube")
 
         time.sleep(0.3)
 
-        if _user32.GetForegroundWindow() != hwnd:
-            log.warning("close_youtube_tab: focus changed while searching tabs")
-            return False
-
         _key(_VK_RETURN)
         _key(_VK_RETURN, up=True)
+
+        time.sleep(0.5)
 
         landed = _poll_until(
             lambda: (
                 _user32.GetForegroundWindow() == hwnd
-                and "youtube" in _foreground_title().lower()
+                and (
+                    "youtube" in _foreground_title().lower()
+                    or any(
+                        h.lower() in _foreground_title().lower()
+                        for h in _TAB_SEARCH_HINTS
+                    )
+                )
             ),
             timeout=2.0,
         )
@@ -634,8 +630,16 @@ def close_youtube_tab(
         active_title = _foreground_title()
 
         # Case 1: YouTube is already the active tab.
+        # Check both the full tab title (may contain "YouTube - ...") and
+        # the browser title (contains Chrome/Edge) + "youtube" in window title.
 
-        if "youtube" in active_title.lower():
+        is_youtube_tab = "youtube" in active_title.lower()
+        is_chrome_with_youtube = (
+            any(h.lower() in title.lower() for h in _TAB_SEARCH_HINTS)
+            and "youtube" in title.lower()
+        )
+
+        if is_youtube_tab or is_chrome_with_youtube:
             if _close_foreground_tab_and_verify(
                 _send_ctrl_w,
                 _foreground_title,

@@ -920,6 +920,9 @@ export default function useAlvin() {
   const openCameraRef = useRef(null);
   const closeCameraRef = useRef(null);
   const cameraFrameRef = useRef(null);
+  // True from the moment a close begins until the next open, so the App.jsx
+  // frame-capture interval never sends a frame after camera_close.
+  const cameraClosingRef = useRef(false);
   const youtubeWinRef = useRef(null);
 
   // Reuses an existing YouTube tab if one is already open; otherwise opens one.
@@ -1030,6 +1033,7 @@ export default function useAlvin() {
         video: true,
         audio: false,
       });
+      cameraClosingRef.current = false;
       cameraStreamRef.current = stream;
       setCameraStream(stream);
       setCameraOpen(true);
@@ -1042,6 +1046,17 @@ export default function useAlvin() {
   }, [addMessage]);
 
   const closeCamera = useCallback(() => {
+    // Flag first: the frame-capture interval checks this before every tick,
+    // so no frame can be captured after the close begins.
+    cameraClosingRef.current = true;
+    // Tell the server so it drops the stored frame; otherwise it keeps
+    // routing every utterance to the camera vision model with a stale image.
+    try {
+      const socket = wsRef.current;
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'camera_close' }));
+      }
+    } catch {}
     const stream = cameraStreamRef.current;
     if (stream) {
       for (const track of stream.getTracks()) track.stop();
@@ -1214,6 +1229,7 @@ export default function useAlvin() {
     openCamera,
     closeCamera,
     sendCameraFrame,
+    cameraClosingRef,
     cameraOpen,
     cameraStream,
     lastYoutube,

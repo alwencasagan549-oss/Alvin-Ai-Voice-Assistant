@@ -38,6 +38,10 @@ app/
   echo.py        Echo / self-trigger suppression
   main.py        FastAPI app: GET /health, WS /ws/transcribe
 run.py          Server entrypoint (uvicorn). --mic also opens the live-mic client
+alvin_hud.py    Desktop HUD frontend (PySide6): main window, live transcript,
+                embedded system-settings dashboard (F2), camera preview (F3).
+                `--hidden` starts it off-screen with the mic armed; it appears
+                when "Alvin, wake up" is heard (used by start.bat).
 requirements.txt
 .env / .env.example   Runtime config (override per deployment)
 tests/
@@ -115,7 +119,7 @@ Supported intents:
 
 | Intent | Examples | Slots |
 |--------|----------|-------|
-| `stop` | "stop", "stop it", "stop the music", "shut up" | — |
+| `stop` | "stop", "stop it", "stop the music", "shut up" | — (music stops also terminate the HUD's local player; the browser is only touched when playback fell back to it) |
 | `pause` | "pause", "pause the music" | — |
 | `resume` | "resume", "resume playing" | — |
 | `mute_mic` | "mute", "mute the mic", "alvin mute" | — (action: `disable_stt`) |
@@ -131,7 +135,12 @@ Supported intents:
 | `previous` | "previous song", "previous", "go back" | — |
 | `play` | "play the music", "play some music", "play" | — |
 | `query_time` | "what time is it", "what's the time", "tell me the time" | — |
+| `open_system` | "open your system", "open system settings", "open your settings", "settings", "control panel" | — |
 | `wake` | "hey alvin", "alvin?", "ok alvin" | — |
+| `wake_up` | any sentence containing "wake up" ("wake up", "alvin wake up", "wake up now") | — (reveals the HUD window; starts one only for a non-HUD client) |
+| `show_home` | "go back to homepage", "go home", "show homepage", "focus the app" | — (closes HUD pop-ups and brings the main window to the front) |
+| `shutdown_laptop` | "turn off my laptop", "shut down the computer", "power off my pc" | — (action: powers off the local machine via the OS shutdown command) |
+| `shutdown` | any utterance containing "goodbye" ("alvin goodbye", "I think it is time to say goodbye") | — (action: graceful server stop; never shuts down the OS) |
 
 Rules:
 
@@ -163,6 +172,19 @@ is not offered the tool. Explicit search/no-search phrases, clear live-info
 hints, and the small-talk/math exclusions still take precedence. When the model
 actually calls `web_search`, the connection speaks the fixed acknowledgement
 **“Let me check that on the web, sir.”** before returning the searched answer.
+
+## YouTube playback
+
+`play_youtube` resolves the song with yt-dlp on the server (cached 5 min). When
+the client is the HUD and `YOUTUBE_ADFREE=true` (default), the server also
+resolves a direct googlevideo stream URL (cached ~4 h); the HUD plays it in
+VLC/mpv/ffplay, which carries no YouTube ads. With `YOUTUBE_AUDIO_ONLY=true`
+(the default) VLC runs with `--intf dummy --no-video`, so audio plays in the
+background and no player window opens; `--no-one-instance` keeps it from
+attaching to a VLC window the user already has open. Set it to false to show
+the video in a player window. If no local player is installed or stream
+resolution fails, the normal watch page opens in the browser. `stop` (including
+"stop the music") terminates the local player.
 
 ## Speaker identification
 
@@ -418,6 +440,8 @@ python -m venv .venv && .venv\Scripts\pip install -r requirements.txt
 python run.py --mic
 # run server only
 python run.py
+# one-click launcher: backend + hidden HUD (appears on "Alvin, wake up")
+start.bat
 # health
 curl http://localhost:8000/health
 # lint

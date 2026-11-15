@@ -93,6 +93,7 @@ ENV_VAR_NAMES = [
     "MAX_CONNECTIONS",
     "MAX_FRAME_SIZE",
     "TRANSCRIPTION_QUEUE_MAXSIZE",
+    "AUDIO_WORKER_THREADS",
     "INTENT_ENABLED",
     "INTENT_SPEAK_CONFIRMATION",
     "INTENT_MIN_CONFIDENCE",
@@ -150,6 +151,10 @@ ENV_VAR_NAMES = [
     "SPEAKER_PROFILES_PATH",
     "SHUTDOWN_RESPONSE_TEXT",
     "SHUTDOWN_DELAY_SEC",
+    "LAPTOP_SHUTDOWN_RESPONSE_TEXT",
+    "LAPTOP_SHUTDOWN_DELAY_SEC",
+    "YOUTUBE_ADFREE",
+    "YOUTUBE_AUDIO_ONLY",
 ]
 
 _NONE = {"", "auto", "none", "null"}
@@ -172,6 +177,10 @@ DEFAULT_INITIAL_PROMPT = (
 
 SHUTDOWN_RESPONSE_TEXT_DEFAULT = (
     "At your service, sir. I will shut down all my system."
+)
+
+LAPTOP_SHUTDOWN_RESPONSE_TEXT_DEFAULT = (
+    "Shutting down your laptop now, sir. Goodbye."
 )
 
 
@@ -317,6 +326,13 @@ class Settings:
     # exhaust memory. Each item is a small audio segment (~0.5-1s).
     # Increased to 200 to reduce drops under load.
     transcription_queue_maxsize: int = field(default_factory=lambda: _env_int("TRANSCRIPTION_QUEUE_MAXSIZE", 200))
+    # Size of the dedicated bounded thread pools for CPU-bound audio work.
+    # Split by criticality in app.audio_pool: a small pool for the latency-critical
+    # Opus encode and a larger pool for TTS decode / Piper synth / speaker
+    # embeddings. A bounded pool keeps a burst of concurrent connections from
+    # saturating the default asyncio executor (sized min(32, cpu+4)) and
+    # starving other to_thread callers. Clamped to [1, 32] at use site.
+    audio_worker_threads: int = field(default_factory=lambda: _env_int("AUDIO_WORKER_THREADS", 8))
 
     # --- intent routing -------------------------------------------------- #
     # Deterministic device-command matching (stop / mute / volume / lights / ...)
@@ -372,9 +388,9 @@ class Settings:
     llm_api_key: str = field(default_factory=lambda: _env("LLM_API_KEY", _env("NVIDIA_API_KEY", "")).strip())
     llm_base_url: str = field(default_factory=lambda: _env("LLM_BASE_URL", "https://api.kilo.ai/api/gateway"))
     llm_model: str = field(default_factory=lambda: _env("LLM_MODEL", "nvidia/nemotron-3.5-lightning:free"))
-    # Vision-capable model used when the camera is active (Nemotron 3.5 Super VL).
-    # Must support image input (array content with image_url).
-    llm_vision_model: str = field(default_factory=lambda: _env("LLM_VISION_MODEL", "nvidia/nemotron-3.5-super-vl:free"))
+    # Vision-capable model used when the camera is active (Nemotron 3 Nano
+    # Omni). Must support image input (array content with image_url).
+    llm_vision_model: str = field(default_factory=lambda: _env("LLM_VISION_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"))
     llm_enabled: bool = field(default_factory=lambda: _env_bool("LLM_ENABLED", True))
     llm_max_tokens: int = field(default_factory=lambda: _env_int("LLM_MAX_TOKENS", 200))
     llm_vision_max_tokens: int = field(default_factory=lambda: _env_int("LLM_VISION_MAX_TOKENS", 100))
@@ -462,8 +478,10 @@ class Settings:
     speaker_profiles_path: str = field(default_factory=lambda: _env("SPEAKER_PROFILES_PATH", "speaker_profiles.pkl"))
 
     # --- shutdown command ------------------------------------------------------ #
-    # Deterministic shutdown intent triggers on "goodbye" / "okay goodbye" /
-    # "thank you alvin goodbye". The response text is spoken before the server
+    # Deterministic shutdown intent triggers on any utterance containing
+    # "goodbye" ("alvin goodbye", "okay goodbye", "I think it is time to say
+    # goodbye"). Only the assistant's own server process is stopped -- never
+    # the operating system. The response text is spoken before the server
     # receives a SIGINT for graceful shutdown.
     shutdown_response_text: str = field(
         default_factory=lambda: _env(
@@ -475,6 +493,33 @@ class Settings:
     # reach the client before the socket closes.
     shutdown_delay_sec: float = field(
         default_factory=lambda: _env_float("SHUTDOWN_DELAY_SEC", 3.0)
+    )
+
+    # --- laptop shutdown command ----------------------------------------------- #
+    # "Alvin, turn off my laptop" powers off the local machine itself via the
+    # operating system's shutdown command. Exact whole-utterance phrase only.
+    laptop_shutdown_response_text: str = field(
+        default_factory=lambda: _env(
+            "LAPTOP_SHUTDOWN_RESPONSE_TEXT", LAPTOP_SHUTDOWN_RESPONSE_TEXT_DEFAULT
+        )
+    )
+    # Windows ``shutdown /s /t N`` countdown. The delay doubles as the window
+    # in which the user can cancel with ``shutdown /a``.
+    laptop_shutdown_delay_sec: float = field(
+        default_factory=lambda: _env_float("LAPTOP_SHUTDOWN_DELAY_SEC", 10.0)
+    )
+
+    # --- YouTube playback ------------------------------------------------------ #
+    # Resolve a direct yt-dlp stream and play it in a local player (VLC/mpv/
+    # ffplay). Direct streams carry no YouTube ads; if resolution or playback
+    # fails the HUD falls back to the normal watch page in the browser.
+    youtube_adfree: bool = field(
+        default_factory=lambda: _env_bool("YOUTUBE_ADFREE", True)
+    )
+    # Audio-only playback uses less bandwidth and starts faster; disable to
+    # show the video in the local player window.
+    youtube_audio_only: bool = field(
+        default_factory=lambda: _env_bool("YOUTUBE_AUDIO_ONLY", True)
     )
 
     @property

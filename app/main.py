@@ -26,6 +26,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketException, status
 from fastapi.responses import JSONResponse
 
+from .audio_pool import shutdown_pools
 from .config import settings
 from .connection import Connection, manager, verify_token
 from .llm import llm_service
@@ -111,6 +112,8 @@ async def lifespan(app: FastAPI):
     await stt_service.shutdown()
     await llm_service.shutdown()
     await shutdown_speaker_service()
+    # Release the bounded audio worker pools last, once no turn can submit more.
+    shutdown_pools()
 
 
 app = FastAPI(

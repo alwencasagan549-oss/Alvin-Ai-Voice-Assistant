@@ -162,6 +162,16 @@ class TestSpeakerService:
         assert result.name is None
 
     def test_identify_offloads_profile_comparison(self, service, monkeypatch):
+        """Profile comparison must run off the event-loop thread.
+
+        The comparison walks every stored embedding and is CPU-bound, so it is
+        offloaded to a worker thread. Audio-CPU work goes through the dedicated
+        media pool (:func:`app.audio_pool.run_in_media_pool`) rather than the
+        default executor, so this test records the *thread* each call runs on
+        instead of asserting a specific offloading helper.
+        """
+        import threading
+
         embedding = np.ones(192, dtype=np.float32)
         profile = SpeakerProfile(speaker_id="alice", name="Alice")
         profile.add_embedding(embedding, 2.0)
@@ -170,18 +180,34 @@ class TestSpeakerService:
             extract_embedding=lambda _audio: embedding.copy()
         )
 
-        original_to_thread = asyncio.to_thread
-        calls = []
+        loop_thread = threading.current_thread()
+        call_threads: list[str] = []
 
-        async def record_to_thread(function, *args, **kwargs):
-            calls.append(function)
-            return await original_to_thread(function, *args, **kwargs)
+        from app import audio_pool
 
-        monkeypatch.setattr(asyncio, "to_thread", record_to_thread)
+        original = audio_pool.run_in_media_pool
+
+        async def record(function, *args, **kwargs):
+            def wrapped(*a, **kw):
+                # Runs on the pool worker: capture the thread there.
+                call_threads.append(threading.current_thread().name)
+                return function(*a, **kw)
+
+            return await original(wrapped, *args, **kwargs)
+
+        monkeypatch.setattr(audio_pool, "run_in_media_pool", record)
+        # speaker.py imports the symbol directly; patch the bound name too.
+        monkeypatch.setattr("app.speaker.run_in_media_pool", record)
+
         result = asyncio.run(service.identify(np.zeros(16000, dtype=np.float32)))
 
         assert result.is_known
-        assert len(calls) == 2
+        assert len(call_threads) == 2
+        # Both ran on media-pool workers (off the loop thread, on the pool).
+        assert all(name != loop_thread.name for name in call_threads)
+        assert all(name.startswith(audio_pool.MEDIA_POOL_PREFIX) for name in call_threads)
+        # Both the embedding extraction and the comparison ran off the loop thread.
+        assert all(name != loop_thread.name for name in call_threads)
 
     def test_persistence_path_uses_configured_setting(self, monkeypatch, tmp_path):
         from app.config import settings

@@ -27,6 +27,7 @@ import numpy as np
 import soundfile as sf
 from groq import AsyncGroq
 
+from .audio_pool import run_in_stt_pool
 from .config import settings
 
 log = logging.getLogger("alvin.stt")
@@ -222,7 +223,7 @@ class GroqBackend:
         prompt = settings.groq_initial_prompt.strip() or None
         try:
             client = await self._get_client()
-            ogg_bytes = await asyncio.to_thread(self._compress_audio, audio)
+            ogg_bytes = await run_in_stt_pool(self._compress_audio, audio)
             async with self._lock:
                 transcription = await client.audio.transcriptions.create(
                     file=("audio.ogg", ogg_bytes, "audio/ogg"),
@@ -316,7 +317,7 @@ class CloudflareSTTBackend:
         start = time.perf_counter()
         try:
             client = await self._get_client()
-            ogg_bytes = await asyncio.to_thread(self._compress_audio, audio)
+            ogg_bytes = await run_in_stt_pool(self._compress_audio, audio)
             async with self._lock:
                 files = {"audio": ("audio.ogg", ogg_bytes, "audio/ogg")}
                 data = {

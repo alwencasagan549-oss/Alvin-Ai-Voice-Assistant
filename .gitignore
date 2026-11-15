@@ -49,3 +49,5 @@ speaker_profiles.pkl
 
 # Piper TTS voice models (large binary files)
 piper_voices/
+
+graphify-out/

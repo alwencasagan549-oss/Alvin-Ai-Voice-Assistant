@@ -54,6 +54,10 @@ UNMUTE_RESPONSE_TEXT = "Successfully unmuted the microphone sir."
 
 SHUTDOWN_RESPONSE_TEXT = "At your service, sir. I will shut down all my system."
 
+LAPTOP_SHUTDOWN_RESPONSE_TEXT = (
+    "Shutting down your laptop now, sir. Goodbye."
+)
+
 OPEN_APPS_RESPONSE_TEXT = "Done sir, I opened {app} for you."
 
 OPEN_VS_CODE_RESPONSE_TEXT = "Done sir, I setup VS Code and open the kilo on the terminal sir just tell what next i will do sir"
@@ -61,6 +65,8 @@ OPEN_VS_CODE_RESPONSE_TEXT = "Done sir, I setup VS Code and open the kilo on the
 OPEN_CAMERA_RESPONSE_TEXT = "Camera is open sir."
 CLOSE_CAMERA_RESPONSE_TEXT = "Done sir, I close the camera."
 WHAT_DO_YOU_SEE_RESPONSE_TEXT = "I am looking at the camera feed now sir."
+
+OPEN_SYSTEM_RESPONSE_TEXT = "Opening system settings, sir."
 
 
 @dataclass(frozen=True)
@@ -277,6 +283,20 @@ _SHOW_DASHBOARD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# System settings command: "open your system", "open system settings",
+# "open your settings", "show settings", "control panel". This is the
+# dashboard-as-settings entry point; the HUD opens its embedded system
+# window when it receives the matching ``command`` event. Registered before
+# ``open_apps`` so "open your system" is not captured as an app launch.
+_OPEN_SYSTEM_RE = re.compile(
+    r"^(?:(?:open|show|display|launch)\s+"
+    r"(?:your\s+|the\s+|my\s+)?"
+    r"(?:system(?:\s+(?:settings|configuration|control\s+panel))?"
+    r"|settings|configuration|control\s+panel)"
+    r"|(?:system\s+)?(?:settings|configuration))$",
+    re.IGNORECASE,
+)
+
 # "open vs code" / "open visual studio code" / "i want to code right now"
 # Opens Visual Studio Code and types "kilo" in its integrated terminal.
 # After wake-word + politeness stripping, "alvin i want to code right now"
@@ -323,6 +343,56 @@ _WHAT_DO_YOU_SEE_RE = re.compile(
 _SHUTDOWN_RE = re.compile(
     rf"^(?:(?:{_word_list('okay', 'ok')}\s+)?goodbye"
     r"|thank\s+you\s+(?:alvin\s+)?goodbye)$",
+    re.IGNORECASE,
+)
+
+# Fallback: a sentence that merely *contains* "goodbye" also shuts the
+# assistant down ("I think it is time to say goodbye"). This is deliberately
+# checked after the command registry so whole-utterance commands win first --
+# "play goodbye on youtube" still plays the song. Matches STT's split "good bye"
+# spelling too, but not words like "goodbyes".
+_GOODBYE_ANYWHERE_RE = re.compile(r"\bgood\s*bye\b", re.IGNORECASE)
+
+# Power off the local machine. This is deliberately a *whole-utterance* match:
+# a stray "turn off my laptop" inside a longer conversation must never power
+# the computer off. Wake word and politeness are stripped first, so
+# "Alvin, please turn off my laptop" matches.
+_LAPTOP_SHUTDOWN_RE = re.compile(
+    r"^(?:(?:turn|switch|power|shut)\s+(?:off|down)\s+"
+    r"(?:my\s+|the\s+)?(?:laptop|computer|pc)"
+    r"|shut\s+(?:my\s+|the\s+)?(?:laptop|computer|pc)\s+down"
+    r"|shutdown\s+(?:my\s+|the\s+)?(?:laptop|computer|pc)"
+    r"|(?:turn|switch|power)\s+(?:my\s+|the\s+)?(?:laptop|computer|pc)\s+off)"
+    r"(?:\s+(?:right\s+)?now)?$",
+    re.IGNORECASE,
+)
+
+# Any utterance containing "wake up" reveals the HUD ("alvin wake up",
+# "wake up now", "wake up alvin"). Like the "goodbye" fallback, the phrase is
+# deliberately matched anywhere in the sentence rather than as a whole-command.
+_WAKE_UP_RE = re.compile(
+    r"\bwake\s+up\b",
+    re.IGNORECASE,
+)
+
+# Return to the assistant's own main window ("go back to homepage"). This is
+# the HUD, not the React dashboard: it closes the settings/camera pop-ups and
+# raises the main window. Whole-utterance match only.
+_SHOW_HOME_RE = re.compile(
+    r"^(?:"
+    # "go (back) (to) (the) homepage" / "get me back home" / "return home"
+    r"(?:go|get|bring|take|come|return|navigate)\s+(?:me\s+)?"
+    r"(?:back\s+)?(?:to\s+)?(?:the\s+)?"
+    r"(?:home\s*(?:page|screen)|home|main\s*(?:page|screen|window))"
+    # "back to homepage" / "back home"
+    r"|(?:back|home)\s+(?:to\s+(?:the\s+)?)?"
+    r"(?:home\s*(?:page|screen)|home|main\s*(?:page|screen|window))"
+    # "show/open/focus (the) homepage"
+    r"|(?:show|open|focus|bring\s+up|bring\s+back)\s+(?:me\s+)?(?:the\s+)?"
+    r"(?:home\s*(?:page|screen)|home|main\s*(?:page|screen|window))"
+    # "focus the app/window/hud"
+    r"|focus\s+(?:the\s+)?(?:app|application|window|hud|assistant)"
+    r")$",
     re.IGNORECASE,
 )
 
@@ -410,12 +480,21 @@ _COMMANDS: tuple[_Command, ...] = (
     _Command("play_youtube", _PLAY_SONG_QUALIFIED_RE, "Playing on YouTube."),
     _Command("play_youtube", _PLAY_ANY_SONG_RE,       "Playing on YouTube."),
     _Command("query_time", _QUERY_TIME_RE),
+    _Command("wake_up", _WAKE_UP_RE, "Waking up for you, sir."),
+    _Command("show_home", _SHOW_HOME_RE, action="focus_hud"),
     _Command("show_dashboard", _SHOW_DASHBOARD_RE, "Opening your dashboard."),
+    _Command("open_system", _OPEN_SYSTEM_RE, OPEN_SYSTEM_RESPONSE_TEXT),
     _Command("open_vs_code", _OPEN_VS_CODE_RE, OPEN_VS_CODE_RESPONSE_TEXT),
     _Command("open_camera", _OPEN_CAMERA_RE, OPEN_CAMERA_RESPONSE_TEXT),
     _Command("close_camera", _CLOSE_CAMERA_RE, CLOSE_CAMERA_RESPONSE_TEXT),
     _Command("what_do_you_see", _WHAT_DO_YOU_SEE_RE, WHAT_DO_YOU_SEE_RESPONSE_TEXT),
     _Command("open_apps", _OPEN_APPS_RE, OPEN_APPS_RESPONSE_TEXT),
+    _Command(
+        "shutdown_laptop",
+        _LAPTOP_SHUTDOWN_RE,
+        LAPTOP_SHUTDOWN_RESPONSE_TEXT,
+        action="laptop_shutdown",
+    ),
     _Command("shutdown", _SHUTDOWN_RE, SHUTDOWN_RESPONSE_TEXT, action="shutdown"),
 )
 
@@ -653,6 +732,21 @@ def route_command(
             slots=slots,
             confirmation=command.confirmation,
             action=command.action,
+            wake_word=wake_word,
+        )
+
+    # "Goodbye" anywhere in the sentence shuts the assistant down even when it
+    # is not the whole utterance. Keeping this after the registry means a real
+    # command in the same sentence ("play goodbye on youtube") still wins.
+    if (allowed is None or "shutdown" in allowed) and _GOODBYE_ANYWHERE_RE.search(
+        normalized
+    ):
+        return IntentMatch(
+            intent="shutdown",
+            raw=raw,
+            normalized=normalized,
+            confirmation=SHUTDOWN_RESPONSE_TEXT,
+            action="shutdown",
             wake_word=wake_word,
         )
     return None

@@ -39,8 +39,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import sounddevice as sd
+from dotenv import load_dotenv
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
+
+# This script is standalone and does not import ``app.config`` (which loads
+# ``.env`` for the server), so load it here before ``main()`` reads API_KEY /
+# SPEAKER_WS_URL / LOG_LEVEL. Without this, values set only in ``.env`` are
+# silently ignored and an auth-protected server rejects the handshake (403).
+load_dotenv(ROOT / ".env")
 
 # --- Audio specifications (must match backend TTS pipeline) ---
 SAMPLE_RATE = 16000
@@ -106,6 +113,10 @@ class SpeakerService:
         # --- Hardware stream ---
         self._stream: sd.OutputStream | None = None
         self._stream_lock = threading.Lock()
+        # Bumped by ``_flush_audio`` so an in-flight write can notice the
+        # barge-in and abandon the rest of its buffer instead of continuing
+        # to play over the user.
+        self._write_generation: int = 0
 
         # --- Turn tracking for barge-in detection ---
         self._turn_active: bool = False
@@ -177,7 +188,8 @@ class SpeakerService:
             if self._playback_task is not None:
                 await asyncio.gather(self._playback_task, return_exceptions=True)
                 self._playback_task = None
-            self._stream = None
+            with self._stream_lock:
+                self._stream = None
             log.info("speaker service stopped")
 
     # ------------------------------------------------------------------ #
@@ -393,14 +405,19 @@ class SpeakerService:
             except asyncio.QueueEmpty:
                 break
 
-        # Abort hardware playback immediately.
-        if self._stream is not None:
-            with self._stream_lock:
-                try:
-                    self._stream.abort()
-                    self._stream.start()  # restart so the next write succeeds
-                except Exception as exc:  # noqa: BLE001
-                    log.debug("stream abort error (may be expected): %s", exc)
+        # Abort hardware playback immediately.  ``abort()``/``start()`` only
+        # touch stream *state*; the blocking ``write()`` runs outside this
+        # lock in ``_safe_write`` so a flush never waits behind a full buffer
+        # and can take effect mid-write.
+        with self._stream_lock:
+            self._write_generation += 1
+            stream = self._stream
+        if stream is not None:
+            try:
+                stream.abort()
+                stream.start()  # restart so the next write succeeds
+            except Exception as exc:  # noqa: BLE001
+                log.debug("stream abort error (may be expected): %s", exc)
 
         self._prebuffer_done = False
         log.info("audio buffer flushed (barge-in)")
@@ -412,9 +429,10 @@ class SpeakerService:
         """Pull PCM chunks from the queue and write to the speaker device.
 
         Blocking ``stream.write()`` calls run inside ``asyncio.to_thread``
-        so the event loop stays free for the WebSocket receive loop.  The
-        ``threading.Lock`` in ``_safe_write`` / ``_flush_audio`` prevents
-        concurrent access to the stream during barge-in.
+        so the event loop stays free for the WebSocket receive loop.  Writes
+        are not serialized against ``_flush_audio`` by the lock (a barge-in
+        must not wait for a full buffer to drain); the flush bumps a
+        generation counter so an in-flight write abandons its remainder.
         """
         with sd.OutputStream(
             samplerate=SAMPLE_RATE,
@@ -424,7 +442,8 @@ class SpeakerService:
             blocksize=1024,
             latency="low",
         ) as stream:
-            self._stream = stream
+            with self._stream_lock:
+                self._stream = stream
             log.info(
                 "audio device ready: %d Hz / %s / %d ch (prebuffer=%d bytes)",
                 SAMPLE_RATE,
@@ -443,22 +462,32 @@ class SpeakerService:
     def _safe_write(self, stream: sd.OutputStream, data: bytes) -> None:
         """Write raw PCM to the stream, recovering from abort/restart races.
 
-        Called from a worker thread via ``asyncio.to_thread``.  The
-        ``threading.Lock`` ensures ``_flush_audio`` can't abort the stream
-        while a write is in flight.
+        Called from a worker thread via ``asyncio.to_thread``.  The blocking
+        ``stream.write()`` deliberately runs *outside* ``_stream_lock``: a
+        barge-in flush only changes stream state and must not block behind an
+        in-flight write.  Instead, a generation counter lets the write notice
+        the flush (or a closed stream) and stop early.
         """
         if not data:
             return
         with self._stream_lock:
+            generation = self._write_generation
+        try:
+            stream.write(data)
+        except Exception as exc:  # noqa: BLE001
+            with self._stream_lock:
+                superseded = self._write_generation != generation
+            if superseded:
+                # A barge-in flushed while this write was in flight; the
+                # buffer has been dropped, so there is nothing to recover.
+                return
+            # Stream may have been aborted/closed; restart and retry once.
+            log.warning("audio write failed (%s); restarting stream", exc)
             try:
+                stream.start()
                 stream.write(data)
-            except Exception:  # noqa: BLE001
-                # Stream may have been aborted by barge-in; restart and retry.
-                try:
-                    stream.start()
-                    stream.write(data)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("audio write failed (recovered): %s", exc)
+            except Exception as retry_exc:  # noqa: BLE001
+                log.warning("audio write failed after restart: %s", retry_exc)
 
     # ------------------------------------------------------------------ #
     # URL helpers

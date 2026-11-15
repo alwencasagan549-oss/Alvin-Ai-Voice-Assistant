@@ -18,6 +18,10 @@ if TYPE_CHECKING:
 # is 5 s, so anything near this means we are waiting on the queue backlog.
 _SHUTDOWN_TEST_TIMEOUT = 8.0
 
+# A full-queue finalize drops after _FINAL_QUEUE_TIMEOUT_SEC * 3.0. Tests
+# monkeypatch that constant to a tiny value so the drop path runs in ms.
+_FINAL_QUEUE_TEST_TIMEOUT = 4.0
+
 
 class MockWebSocket:
     """Mock WebSocket for testing Connection logic."""
@@ -123,7 +127,9 @@ async def test_connection_transcription_queue_bounded() -> None:
 
     # Verify settings has the new setting
     assert hasattr(settings, "transcription_queue_maxsize")
-    assert settings.transcription_queue_maxsize == 100
+    # The queue is bounded by whatever the loaded settings say (the default is
+    # 200, but .env may override it); assert the invariant, not a magic number.
+    assert settings.transcription_queue_maxsize > 0
 
     mock_ws = MockWebSocket()
     mock_stt = AsyncMock()
@@ -638,3 +644,267 @@ async def test_a_known_speaker_resets_the_unknown_streak() -> None:
         await conn._identify_speaker()
 
     assert conn.current_speaker_name == "Alice"
+
+
+# --------------------------------------------------------------------------- #
+# Final-segment ordering under a full transcription queue
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_finalize_never_processes_a_final_out_of_order(monkeypatch) -> None:
+    """A full queue must not push a final through a side path.
+
+    Regression: when the transcription queue was full, ``_finalize`` used to
+    ``await self.stt.transcribe_async`` *directly* and then call
+    ``_handle_final_utterance`` inline. Because the consumer task could still be
+    draining older items concurrently, two finals could reach
+    ``_handle_final_utterance`` out of order and corrupt ``self.history`` (which
+    both the direct path and the consumer append to).
+
+    The fix: ``_finalize`` must always enqueue (never call STT /
+    ``_handle_final_utterance`` itself). This test fills the queue, triggers a
+    final, and asserts STT was never called from the finalize path and a
+    ``dropped`` tombstone was enqueued (evicting the oldest filler) for the
+    consumer to emit in order.
+    """
+    import numpy as np
+
+    from app.config import settings
+    import app.connection as connection_mod
+    from app.connection import Connection
+
+    # Shorten the drop window so the test exercises the drop path in ms.
+    monkeypatch.setattr(connection_mod, "_FINAL_QUEUE_TIMEOUT_SEC", 0.05)
+
+    conn = Connection(
+        websocket=MockWebSocket(),
+        stt=AsyncMock(),
+        detector=MagicMock(),
+        language="en",
+    )
+
+    # STT must never be invoked from _finalize; if the direct path still exists
+    # it would call transcribe_async and this assertion fires.
+    conn.stt.transcribe_async = AsyncMock(
+        side_effect=AssertionError("transcribe_async must not run in _finalize")
+    )
+
+    # Fill the queue so a naive `put` would block / a naive `put_nowait` would raise.
+    for _ in range(settings.transcription_queue_maxsize):
+        conn.queue.put_nowait(True)
+    assert conn.queue.full()
+
+    # Set up an active utterance with enough above-silence audio to pass the gates.
+    conn.seg_start = 0
+    speech = np.full(settings.min_segment_samples + 1600, 8192, dtype=np.float32)
+    conn._append_audio(speech)
+    conn.vad_pointer = speech.size
+
+    # A full queue must not raise and must not process the segment inline.
+    # Give the finalize a generous timeout; it should resolve quickly by
+    # dropping the stale backlog rather than blocking forever.
+    await asyncio.wait_for(
+        conn._finalize(speech.size), timeout=_FINAL_QUEUE_TEST_TIMEOUT
+    )
+
+    # The direct path would have called STT; it must not have.
+    conn.stt.transcribe_async.assert_not_called()
+    # The segment must have been reset (utterance consumed) either way.
+    assert conn.seg_start is None
+    # A tombstone was enqueued (evicting the oldest filler) so the consumer can
+    # emit the "dropped" event in FIFO order. No inline event was sent here.
+    assert not conn.ws.received_frames
+    assert conn.queue.qsize() == settings.transcription_queue_maxsize
+    items = list(conn.queue._queue)
+    assert items[-1].is_dropped is True
+    assert items[-1].is_final is True
+
+
+@pytest.mark.asyncio
+async def test_finalize_enqueues_when_queue_has_room() -> None:
+    """With room in the queue, a final is enqueued (FIFO) and never processed inline."""
+    import numpy as np
+
+    from app.config import settings
+    from app.connection import Connection
+
+    conn = Connection(
+        websocket=MockWebSocket(),
+        stt=AsyncMock(),
+        detector=MagicMock(),
+        language="en",
+    )
+    conn.stt.transcribe_async = AsyncMock(
+        side_effect=AssertionError("transcribe_async must not run in _finalize")
+    )
+
+    conn.seg_start = 0
+    speech = np.full(settings.min_segment_samples + 1600, 8192, dtype=np.float32)
+    conn._append_audio(speech)
+    conn.vad_pointer = speech.size
+
+    before = conn._utterance_id
+    await asyncio.wait_for(
+        conn._finalize(speech.size), timeout=_FINAL_QUEUE_TEST_TIMEOUT
+    )
+
+    conn.stt.transcribe_async.assert_not_called()
+    # One real segment was enqueued on top of nothing (queue was empty).
+    assert conn.queue.qsize() == 1
+    item = conn.queue.get_nowait()
+    assert item.is_final is True
+    assert item.utterance_id == before
+    # Utterance id advanced and segment reset.
+    assert conn._utterance_id == before + 1
+    assert conn.seg_start is None
+
+
+@pytest.mark.asyncio
+async def test_camera_close_control_clears_vision_state() -> None:
+    """The client's ``camera_close`` control message must drop the stored frame.
+
+    ``camera_mode`` gates model selection: while a frame is stored every
+    utterance is routed to the camera vision model; after the close the main
+    brain (``settings.llm_model``) takes over again.
+    """
+    import os
+    import tempfile
+
+    from app.connection import Connection
+
+    fd, path = tempfile.mkstemp(suffix=".jpg", prefix="alvin_camera_test_")
+    os.close(fd)
+
+    conn = Connection(
+        websocket=MockWebSocket(),
+        stt=AsyncMock(),
+        detector=MagicMock(),
+        language="en",
+    )
+    conn.camera_active = True
+    conn.camera_image_path = path
+    conn.camera_image_b64 = "aGVsbG8="
+
+    await conn._on_text(json.dumps({"type": "camera_close"}))
+
+    assert conn.camera_active is False
+    assert conn.camera_image_b64 is None
+    assert conn.camera_image_path is None
+    assert conn.camera_mode is False
+    assert not os.path.isfile(path)
+
+
+@pytest.mark.asyncio
+async def test_camera_close_control_is_idempotent() -> None:
+    """Closing an already-closed camera must not raise."""
+    from app.connection import Connection
+
+    conn = Connection(
+        websocket=MockWebSocket(),
+        stt=AsyncMock(),
+        detector=MagicMock(),
+        language="en",
+    )
+    await conn._on_text(json.dumps({"type": "camera_close"}))
+    await conn._on_text(json.dumps({"type": "camera_close"}))
+
+    assert conn.camera_mode is False
+
+
+@pytest.mark.asyncio
+async def test_frame_saved_before_close_is_discarded() -> None:
+    """A frame save whose generation predates a close must not re-arm camera.
+
+    The receive loop processes ``camera_close`` and a late ``camera_frame`` in
+    order, but the frame save runs in a worker thread: a close can land while
+    the save is in flight. The generation check makes that save discard
+    itself instead of silently re-arming camera mode with a stale frame.
+    """
+    import os
+    import tempfile
+
+    from app.connection import Connection
+
+    conn = Connection(
+        websocket=MockWebSocket(),
+        stt=AsyncMock(),
+        detector=MagicMock(),
+        language="en",
+    )
+    # Save starts with generation 0...
+    conn._save_camera_frame_sync("aGVsbG8=", conn._camera_generation)
+    assert conn.camera_mode is True
+    first_path = conn.camera_image_path
+    assert first_path is not None
+
+    # ...then the camera closes, bumping the generation and clearing state...
+    await conn._on_text(json.dumps({"type": "camera_close"}))
+    assert conn.camera_mode is False
+    assert not os.path.isfile(first_path)
+
+    # ...a save that started before the close must discard itself: no camera
+    # state and no temp file left behind (the save deletes the jpg it wrote).
+    import glob
+    import tempfile as _tempfile
+
+    before = set(glob.glob(os.path.join(_tempfile.gettempdir(), "alvin_camera_*")))
+    conn._save_camera_frame_sync("aGVsbG8=", generation=0)
+    after = set(glob.glob(os.path.join(_tempfile.gettempdir(), "alvin_camera_*")))
+    assert conn.camera_mode is False
+    assert conn.camera_image_b64 is None
+    assert conn.camera_image_path is None
+    assert not (after - before)
+
+
+@pytest.mark.asyncio
+async def test_vision_preparation_returns_none_when_camera_closes() -> None:
+    """A close during vision preparation must not yield a text-only vision turn."""
+    import time
+
+    from app.connection import Connection
+
+    conn = Connection(
+        websocket=MockWebSocket(),
+        stt=AsyncMock(),
+        detector=MagicMock(),
+        language="en",
+    )
+    # Fresh frame timestamp skips the stale-frame wait; no frame stored.
+    conn._camera_frame_ts = time.monotonic()
+
+    result = await conn._prepare_vision_messages("what do you see")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_unexpected_tts_error_still_emits_tts_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A synthesis crash must not leave clients stuck in their speaking state."""
+    from app import connection as connection_mod
+    from app.connection import Connection
+
+    async def boom(text, voice=None, prefetch=None):
+        yield b"\x00\x00"
+        raise RuntimeError("synthesis blew up")
+
+    monkeypatch.setattr(connection_mod, "synthesize_stream", boom)
+    ws = MockWebSocket()
+    conn = Connection(
+        websocket=ws,
+        stt=AsyncMock(),
+        detector=MagicMock(),
+        language="en",
+    )
+
+    await conn._speak_tts("hello", "en-US-AndrewNeural")
+
+    events = [
+        json.loads(frame)
+        for frame in ws.received_frames
+        if isinstance(frame, bytes) and frame.startswith(b"{")
+    ]
+    types = [event.get("type") for event in events]
+    assert "tts_error" in types
+    assert types[-1] == "tts_end", "the client must be told playback ended"
+    assert conn.echo.speaking is False

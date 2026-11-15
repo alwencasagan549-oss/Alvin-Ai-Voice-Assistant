@@ -101,7 +101,7 @@ _SENTENCE_END = re.compile(r"(?<=[.!?])\s+|\n+")
 
 # Voice override detection patterns
 _FORCE_SEARCH_PATTERNS = [
-    r"\bsearch\s+the\s+web\b",
+    r"\bsearch\b",
     r"\blook\s+it\s+up\b",
     r"\bgoogle\s+it\b",
 ]
@@ -118,17 +118,17 @@ WEB_SEARCH_ACK = "Let me check that on the web, sir."
 
 def _check_voice_override(text: str) -> int | None:
     """Check for voice overrides.
-    
+
     Returns:
         1 to force search, 0 to disable search, None for no override.
     """
     text_lower = text.lower()
-    for pattern in _FORCE_SEARCH_PATTERNS:
-        if re.search(pattern, text_lower):
-            return 1
     for pattern in _DISABLE_SEARCH_PATTERNS:
         if re.search(pattern, text_lower):
             return 0
+    for pattern in _FORCE_SEARCH_PATTERNS:
+        if re.search(pattern, text_lower):
+            return 1
     return None
 
 
@@ -334,6 +334,10 @@ _TOOL_CALL_TEXT_RE = re.compile(
 )
 
 
+def _clean_sentence(text: str) -> str:
+    return _strip_tool_call_text(_filter_narration(sanitize_for_voice(text)))
+
+
 def _strip_tool_call_text(text: str) -> str:
     """Remove any tool-call-shaped text a weak model emitted as content."""
     if not text:
@@ -355,18 +359,15 @@ def _should_search(text: str) -> bool:
     """Return True when the utterance should enable the web-search tool.
 
     Rules (first match wins):
-      * "search the web / look it up / google it" -> True
-      * "don't search / no search"                -> False
-      * small talk / greetings / meta             -> False
-      * obvious math question                     -> False
-      * contains what/how/when/who/where/if (or a
-        related question word)                    -> True
+      * Contains "search" / "look it up" / "google it" -> True
+      * "don't search / no search"                      -> False
+      * small talk / greetings / meta                   -> False
+      * obvious math question                           -> False
       * contains a live-info hint (latest, news, weather, price…) -> True
-      * otherwise                                 -> False
+      * otherwise                                       -> False
 
-    A question word anywhere in the utterance is enough. An ordinary
-    conversational sentence without one of these words stays conversational
-    and does not get the search tool.
+    Web search requires explicit "search" in the utterance. Question words
+    no longer trigger automatic web search.
     """
     if not text or not text.strip():
         return False
@@ -393,9 +394,6 @@ def _should_search(text: str) -> bool:
 
     if _MATH_QUESTION_RE.search(tl):
         return False
-
-    if _contains_question_word(tl):
-        return True
 
     return bool(any(hint in tl for hint in _LIVE_INFO_HINTS))
 
@@ -1295,9 +1293,7 @@ class LLMService:
                                 if sentence_buffer[i] in ".!?":
                                     sentence = sentence_buffer[: i + 1].strip()
                                     sentence_buffer = sentence_buffer[i + 1 :]
-                                    cleaned = _strip_tool_call_text(
-                                        _filter_narration(sanitize_for_voice(sentence))
-                                    )
+                                    cleaned = _clean_sentence(sentence)
                                     if cleaned:
                                         yield cleaned, model_name or settings.llm_model
                                     break
@@ -1390,9 +1386,7 @@ class LLMService:
                 if buffer_content:
                     emitted = 0
                     for sentence in _split_sentences(content_buffer):
-                        cleaned = _strip_tool_call_text(
-                            _filter_narration(sanitize_for_voice(sentence))
-                        )
+                        cleaned = _clean_sentence(sentence)
                         if cleaned:
                             yield cleaned, model_name or settings.llm_model
                             emitted += 1
@@ -1407,9 +1401,7 @@ class LLMService:
                 else:
                     remainder = sentence_buffer.strip()
                     if remainder:
-                        cleaned = _strip_tool_call_text(
-                            _filter_narration(sanitize_for_voice(remainder))
-                        )
+                        cleaned = _clean_sentence(remainder)
                         if cleaned:
                             yield cleaned, model_name or settings.llm_model
                         elif remainder:
@@ -1486,9 +1478,7 @@ class LLMService:
                             buffer = buffer[i + 1 :]
                             # Bug 24: strip narration/tool-call scaffolding so
                             # "Let me search..." preambles never reach the mic.
-                            cleaned = _strip_tool_call_text(
-                                _filter_narration(sanitize_for_voice(sentence))
-                            )
+                            cleaned = _clean_sentence(sentence)
                             if cleaned:
                                 yield cleaned, model_name
                             break
@@ -1503,9 +1493,7 @@ class LLMService:
             if remainder:
                 # Bug 24: apply the sanitizer chain to the streamed remainder
                 # too (mirrors _stream_primary_raw / _stream_cloudflare).
-                cleaned = _strip_tool_call_text(
-                    _filter_narration(sanitize_for_voice(remainder))
-                )
+                cleaned = _clean_sentence(remainder)
                 if cleaned:
                     yield cleaned, model_name
         finally:
@@ -1606,7 +1594,9 @@ class LLMService:
                         if buffer[i] in ".!?":
                             sentence = buffer[: i + 1].strip()
                             buffer = buffer[i + 1 :]
-                            cleaned = sanitize_for_voice(sentence)
+                            # Bug 24 fix: strip narration/tool-call scaffolding so
+                            # "Let me search..." preambles never reach the mic.
+                            cleaned = _clean_sentence(sentence)
                             if cleaned:
                                 yield cleaned, model_name
                             break
@@ -1621,9 +1611,7 @@ class LLMService:
             if remainder:
                 # Bug 24: apply the sanitizer chain to the streamed remainder
                 # too (mirrors _stream_primary).
-                cleaned = _strip_tool_call_text(
-                    _filter_narration(sanitize_for_voice(remainder))
-                )
+                cleaned = _clean_sentence(remainder)
                 if cleaned:
                     yield cleaned, model_name
         finally:
@@ -1724,7 +1712,9 @@ class LLMService:
                         if buffer[i] in ".!?":
                             sentence = buffer[: i + 1].strip()
                             buffer = buffer[i + 1 :]
-                            cleaned = sanitize_for_voice(sentence)
+                            # Bug 24 fix: strip narration/tool-call scaffolding so
+                            # "Let me search..." preambles never reach the mic.
+                            cleaned = _clean_sentence(sentence)
                             if cleaned:
                                 yield cleaned, model_name
                             break
@@ -1737,9 +1727,7 @@ class LLMService:
         else:
             remainder = buffer.strip()
             if remainder:
-                cleaned = _strip_tool_call_text(
-                    _filter_narration(sanitize_for_voice(remainder))
-                )
+                cleaned = _clean_sentence(remainder)
                 if cleaned:
                     yield cleaned, model_name
         finally:

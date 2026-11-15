@@ -13,6 +13,9 @@ opencv-python-headless~=4.10.0
 openai~=1.68.0
 sounddevice>=0.5.1
 websockets>=15.0
+# Desktop HUD frontend. The PySide6 meta-package pulls in QtWebEngineWidgets,
+# which hosts the React dashboard as the embedded system-settings window.
+PySide6>=6.8
 # Web search primary is the Gemini CLI (npm install -g @google/gemini-cli),
 # not a pip package. ddgs below is the key-free fallback.
 ddgs>=9.0
