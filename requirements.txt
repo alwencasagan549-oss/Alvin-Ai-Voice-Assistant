@@ -20,3 +20,7 @@ PySide6>=6.8
 # not a pip package. ddgs below is the key-free fallback.
 ddgs>=9.0
 yt-dlp>=2024.10.0
+# Google Tasks (optional wake-up briefing source). Enable with
+# BRIEFING_TASKS_ENABLED=true after running scripts/google_tasks_auth.py.
+google-api-python-client>=2.100.0
+google-auth-oauthlib>=1.0.0

@@ -65,7 +65,9 @@ def test_silence_gap_bytes_length():
 
 
 def test_trimmer_drops_leading_silence():
-    trimmer = EdgeSilenceTrimmer(threshold=dbfs_to_amplitude(-50), hold=1600)
+    trimmer = EdgeSilenceTrimmer(
+        threshold=dbfs_to_amplitude(-50), leading_hold=1600, trailing_hold=1600
+    )
     out = trimmer.push(pcm(silence(500)))
     assert out == b""  # nothing but silence so far
     out = trimmer.push(pcm(tone(200)))
@@ -74,7 +76,9 @@ def test_trimmer_drops_leading_silence():
 
 
 def test_trimmer_drops_trailing_silence_on_flush():
-    trimmer = EdgeSilenceTrimmer(threshold=dbfs_to_amplitude(-50), hold=1600)
+    trimmer = EdgeSilenceTrimmer(
+        threshold=dbfs_to_amplitude(-50), leading_hold=1600, trailing_hold=1600
+    )
     emitted = trimmer.push(pcm(cat(silence(100), tone(300))))
     trimmed = trimmer.push(pcm(cat(tone(100), silence(400))))
     tail = trimmer.flush()
@@ -87,7 +91,9 @@ def test_trimmer_drops_trailing_silence_on_flush():
 
 
 def test_trimmer_keeps_speech_when_flushed():
-    trimmer = EdgeSilenceTrimmer(threshold=dbfs_to_amplitude(-50), hold=800)
+    trimmer = EdgeSilenceTrimmer(
+        threshold=dbfs_to_amplitude(-50), leading_hold=800, trailing_hold=800
+    )
     trimmer.push(pcm(cat(silence(100), tone(100))))
     trimmer.push(pcm(tone(200)))  # held tail is speech, not silence
     tail = trimmer.flush()
@@ -96,14 +102,18 @@ def test_trimmer_keeps_speech_when_flushed():
 
 
 def test_trimmer_hold_zero_is_passthrough_after_onset():
-    trimmer = EdgeSilenceTrimmer(threshold=dbfs_to_amplitude(-50), hold=0)
+    trimmer = EdgeSilenceTrimmer(
+        threshold=dbfs_to_amplitude(-50), leading_hold=0, trailing_hold=0
+    )
     assert trimmer.push(pcm(cat(silence(100), tone(100)))) != b""
     block = pcm(tone(100))
     assert trimmer.push(block) == block
 
 
 def test_trimmer_discards_all_silent_sentence():
-    trimmer = EdgeSilenceTrimmer(threshold=dbfs_to_amplitude(-50), hold=1600)
+    trimmer = EdgeSilenceTrimmer(
+        threshold=dbfs_to_amplitude(-50), leading_hold=1600, trailing_hold=1600
+    )
     trimmer.push(pcm(silence(2000)))
     assert trimmer.flush() == b""
     assert trimmer.speech_started is False
@@ -154,7 +164,7 @@ def _fake_pipeline(monkeypatch, chunks_per_sentence: int = 3):
     frame_samples = 1600  # 100 ms of audio per fake chunk
 
     class FakeAssembler:
-        def __init__(self, threshold, hold, interval_bytes):
+        def __init__(self, threshold, leading_hold, trailing_hold, interval_bytes):
             self._left = chunks_per_sentence
 
         async def push(self, mp3_chunk):
@@ -173,7 +183,8 @@ def _fake_pipeline(monkeypatch, chunks_per_sentence: int = 3):
 
     monkeypatch.setattr(tts_module, "_PcmAssembler", FakeAssembler)
     monkeypatch.setattr(tts_module, "_fetch_sentence_mp3", fake_fetch)
-    monkeypatch.setattr(settings, "tts_trim_edge_ms", 0)
+    monkeypatch.setattr(settings, "tts_trim_leading_ms", 0)
+    monkeypatch.setattr(settings, "tts_trim_trailing_ms", 0)
     monkeypatch.setattr(settings, "tts_sentence_gap_ms", 120)
     return frame_samples, asyncio
 

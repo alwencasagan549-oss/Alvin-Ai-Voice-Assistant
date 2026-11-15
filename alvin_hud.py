@@ -176,6 +176,7 @@ class BackendWorker(QObject):
     partial_transcript = Signal(str)
     final_transcript = Signal(str)
     llm_received = Signal(str)
+    briefing_received = Signal(str)
     mic_level = Signal(float)
     out_level = Signal(float)
     link_changed = Signal(bool)
@@ -318,6 +319,8 @@ class BackendWorker(QObject):
                     self.final_transcript.emit(data["transcript"])
         elif data.get("type") == "llm_response":
             self.llm_received.emit(data.get("text", ""))
+        elif data.get("type") == "briefing":
+            self.briefing_received.emit(data.get("text", ""))
         elif data.get("type") == "command":
             self.command_received.emit(data.get("intent", ""), data.get("slots") or {})
         elif data.get("type") == "request_camera_frame":
@@ -1145,6 +1148,12 @@ class SystemWindow(QMainWindow):
 
         QShortcut(QKeySequence("F5"), self).activated.connect(self.view.reload)
         QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(self.view.reload)
+        QShortcut(QKeySequence(Qt.Key_F11), self).activated.connect(
+            self.toggle_fullscreen
+        )
+        QShortcut(QKeySequence(Qt.Key_Escape), self).activated.connect(
+            self._leave_fullscreen
+        )
 
     def _on_loaded(self, ok):
         if self._loading_error_page:
@@ -1165,6 +1174,13 @@ class SystemWindow(QMainWindow):
         """Reload immediately when the last load failed and retries are pending."""
         if self._loading_error_page:
             self._retry_load()
+
+    def toggle_fullscreen(self):
+        self.showNormal() if self.isFullScreen() else self.showFullScreen()
+
+    def _leave_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
 
 
 # --------------------------------------------------------------------------
@@ -1524,6 +1540,7 @@ class AlvinWindow(QMainWindow):
         w.partial_transcript.connect(self.update_partial)
         w.final_transcript.connect(self.log.add_user)
         w.llm_received.connect(self.log.add_alvin)
+        w.briefing_received.connect(self.log.add_alvin)
         w.mic_level.connect(self._on_mic_level)
         w.out_level.connect(self._on_out_level)
         w.link_changed.connect(self._on_link)
@@ -1589,8 +1606,8 @@ class AlvinWindow(QMainWindow):
             self.close()
 
     def reveal(self):
-        """Bring the HUD on screen (it starts hidden under start.bat)."""
-        self.showNormal()
+        """Bring the HUD on screen fullscreen (it starts hidden under start.bat)."""
+        self.showFullScreen()
         self.raise_()
         self.activateWindow()
         self.setFocus()
@@ -1731,18 +1748,22 @@ class AlvinWindow(QMainWindow):
             else:
                 args = [
                     "--no-one-instance", "--play-and-exit", "--quiet",
-                    "--no-video-title-show",
+                    "--no-video-title-show", "--fullscreen",
                 ]
             args.append(stream_url)
         elif name.startswith("mpv"):
             args = ["--no-terminal"]
             if audio_only:
                 args.extend(["--no-video", "--force-window=no"])
+            else:
+                args.append("--fullscreen")
             args.append(stream_url)
         elif name.startswith("ffplay"):
             args = ["-autoexit", "-loglevel", "error"]
             if audio_only:
                 args.append("-nodisp")
+            else:
+                args.append("-fs")
             args.append(stream_url)
         else:
             return False
@@ -1784,7 +1805,7 @@ class AlvinWindow(QMainWindow):
 
     def _show_system_window(self, request_start: bool):
         if self.system_window is not None:
-            self.system_window.showNormal()
+            self.system_window.showFullScreen()
             self.system_window.raise_()
             self.system_window.activateWindow()
             self.system_window.reload_if_stale()
@@ -1796,7 +1817,7 @@ class AlvinWindow(QMainWindow):
         self.system_window = SystemWindow(DASHBOARD_URL + "#settings")
         self.system_window.setAttribute(Qt.WA_DeleteOnClose, True)
         self.system_window.destroyed.connect(self._on_system_window_closed)
-        self.system_window.show()
+        self.system_window.showFullScreen()
         if request_start:
             # Ask the server to start the dashboard dev server if needed.
             self.worker.send_json({"type": "open_system"})
@@ -1806,7 +1827,7 @@ class AlvinWindow(QMainWindow):
 
     def open_camera_window(self):
         if self.camera_window is not None:
-            self.camera_window.showNormal()
+            self.camera_window.showFullScreen()
             self.camera_window.raise_()
             self.camera_window.activateWindow()
             return
@@ -1814,7 +1835,7 @@ class AlvinWindow(QMainWindow):
             return
         self.camera_window = CameraWindow(self.worker)
         self.camera_window.closed.connect(self._on_camera_window_closed)
-        self.camera_window.show()
+        self.camera_window.showFullScreen()
 
     def _on_camera_window_closed(self):
         self.camera_window = None
@@ -1873,6 +1894,6 @@ if __name__ == "__main__":
     if hidden:
         window.hide()
     else:
-        window.show()
+        window.showFullScreen()
 
     sys.exit(app.exec())

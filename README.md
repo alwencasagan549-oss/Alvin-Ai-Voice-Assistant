@@ -1,6 +1,6 @@
 # Alvin AI Voice Assistant
 
-**Current release: v1.1.1**
+**Current release: v1.1.2** — adds the wake-up briefing.
 
 A low-latency, real-time voice assistant with a J.A.R.V.I.S.-style holographic
 desktop UI. Speak into your microphone and Alvin transcribes you, thinks with a
@@ -19,6 +19,8 @@ Alvin also includes:
 
 - A PySide6 holographic HUD (`alvin_hud.py`) that can start hidden and appear
   when you say **"Alvin, wake up"**.
+- A **wake-up briefing**: a time-aware greeting, current weather, open tasks,
+  and the latest email, spoken as Alvin appears.
 - A React dashboard (`alvin-ai-dashboard/`) for status, settings, and vision.
 - Deterministic voice intents for media, microphone, volume, lights, apps,
   camera, YouTube, shutdown, and more.
@@ -266,7 +268,7 @@ you can say the command with or without "Alvin".
 
 | Say | Does |
 |-----|------|
-| "Alvin, wake up" | Reveals the hidden HUD |
+| "Alvin, wake up" | Reveals the hidden HUD fullscreen and speaks the briefing |
 | "stop" / "pause" / "resume" | Controls playback |
 | "mute" / "unmute the mic" | Toggles microphone transcription |
 | "volume up" / "set volume to 50" | Volume control |
@@ -284,6 +286,77 @@ you can say the command with or without "Alvin".
 The full registry lives in `app/intents.py`. The shutdown and laptop-shutdown
 response texts are configurable in `.env`; other confirmations are constants in
 that module.
+
+---
+
+## Wake-up briefing
+
+Saying **"Alvin, wake up"** reveals the HUD and speaks a briefing in this shape:
+
+> Good afternoon, sir. Today is Sunday, November 15, 2:35 PM. The weather in
+> Cagayan de Oro is 31 degrees Celsius, partly cloudy. You have 2 open tasks:
+> submit the quarterly report; call the bank. Your latest email is from Alice,
+> about Project update. What's on your mind today, sir?
+
+1. **Greeting** — "Good morning / afternoon / evening, sir", the date, and the
+   time on a 12-hour clock.
+2. **Weather** — current temperature and conditions from MET Norway.
+3. **Open tasks** — the first few items in Google Tasks. If there are none,
+   Alvin says "You don't have any available tasks right now, sir."
+4. **Latest email** — sender and subject of the newest unread Gmail message. If
+   there is none, Alvin says "You don't have any new email right now, sir."
+
+All three sources are on by default. Every source is independent: if one fails
+or is slow, Alvin says so and still speaks the rest. Weather and email are
+cached (10 minutes and 2 minutes) and prefetched at startup, which keeps the
+first wake-up fast.
+
+### Weather (Open-Meteo + MET Norway)
+
+No API key, signup, or billing. Set `BRIEFING_WEATHER_LOCATION` to your city;
+Open-Meteo's geocoding endpoint resolves it to coordinates and MET Norway's
+Locationforecast API returns the current temperature and conditions. Weather
+data from MET Norway is used under CC BY 4.0.
+
+### Gmail (read-only)
+
+1. Turn on 2-Step Verification, then create an **App Password** at
+   <https://myaccount.google.com/apppasswords>.
+2. In `.env`:
+
+   ```
+   BRIEFING_EMAIL_ENABLED=true
+   BRIEFING_EMAIL_IMAP_USER=you@gmail.com
+   BRIEFING_EMAIL_IMAP_PASSWORD=the16characterapppassword
+   ```
+
+Alvin opens the mailbox read-only, fetches only `From`/`Subject`/`Date` with
+`BODY.PEEK` (never the body), and never marks anything as read. One-time
+codes, verification, and password-reset subjects are skipped by default.
+
+### Google Tasks (OAuth)
+
+1. In the Google Cloud console, enable the **Google Tasks API** and configure
+   the OAuth consent screen (add your account as a test user).
+2. Create an OAuth client of type **Desktop app** and save the JSON as
+   `credentials/client_secret.json`.
+3. Run:
+
+   ```
+   python scripts/google_tasks_auth.py
+   ```
+
+4. In `.env`, set `BRIEFING_TASKS_ENABLED=true`.
+
+`credentials/` is gitignored; the token grants read-only `tasks.readonly`
+access and is never used to modify your list.
+
+### Polishing with the LLM
+
+The briefing is composed from templates so it works without an LLM. Set
+`BRIEFING_LLM_POLISH=true` to have the configured LLM rewrite the same facts
+into one natural paragraph. If the model fails, Alvin falls back to the
+template automatically.
 
 ---
 
@@ -322,6 +395,11 @@ commented list). The ones you'll most often touch:
 | `SPEAKER_ENABLED` | `false` | Enable speaker identification using ECAPA-TDNN embeddings |
 | `YOUTUBE_ADFREE` | `true` | Resolve a direct stream for ad-free playback |
 | `YOUTUBE_AUDIO_ONLY` | `true` | Audio-only playback (less bandwidth, faster start) |
+| `BRIEFING_ENABLED` | `true` | Speak a time-aware briefing on "wake up" |
+| `BRIEFING_WEATHER_LOCATION` | `Cagayan de Oro` | City for the current-weather line (Open-Meteo geocoding + MET Norway forecast, no key) |
+| `BRIEFING_TASKS_ENABLED` | `true` | Read open Google Tasks |
+| `BRIEFING_EMAIL_ENABLED` | `true` | Read the latest Gmail headers over IMAP |
+| `BRIEFING_LLM_POLISH` | `false` | Rewrite the templated briefing with the LLM |
 | `SHUTDOWN_DELAY_SEC` | `3.0` | Delay after the spoken goodbye before the server stops |
 | `LAPTOP_SHUTDOWN_DELAY_SEC` | `10` | Windows shutdown countdown |
 
@@ -353,6 +431,10 @@ app/
   echo.py         Echo / self-trigger suppression
   web_search.py   Tavily + DuckDuckGo search with a 5-minute cache
   youtube.py      yt-dlp search and stream resolution
+  briefing.py     Wake-up briefing: greeting, weather, tasks, email, optional LLM polish
+  weather.py      Current conditions (Open-Meteo geocoding + MET Norway, no API key)
+  email_source.py Read-only Gmail IMAP header fetch
+  tasks.py        Google Tasks (read-only OAuth)
   browser.py      Windows browser-tab automation for YouTube stop
   audio_pool.py   Bounded worker pools for Opus encode, MP3 decode, Piper, embeddings
   main.py         FastAPI app: GET /health, WS /ws/transcribe
@@ -374,6 +456,8 @@ Scripts:
 - `scripts/tts_voice_samples.py` — list voices + render sample MP3s to `voice_samples/`
 - `scripts/measure_stt_tts_latency.py` — manual STT→TT latency benchmark
 - `scripts/audio_playback.py` — shared low-latency playback engine
+- `scripts/google_tasks_auth.py` — one-time OAuth setup for the Google Tasks
+  briefing source (writes `credentials/google_tasks_token.json`)
 
 ---
 
@@ -410,9 +494,5 @@ Scripts:
 
 ## Roadmap
 
-The next planned feature is a **wake-up briefing**. On "Alvin, wake up", Alvin
-will greet you based on the time of day, read a short summary of trending
-technology news, list your tasks, and summarize your latest email. The agreed
-design uses Gmail over IMAP (headers only), Google Tasks, and templated speech
-with an optional LLM-polish toggle. This is **not implemented in v1.1.1**; the
-current release is the working baseline.
+The **wake-up briefing** shipped in v1.1.2. v1.1.2 is the current release; this
+README describes the current working tree.

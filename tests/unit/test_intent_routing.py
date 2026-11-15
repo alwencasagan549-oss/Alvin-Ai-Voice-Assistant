@@ -225,6 +225,36 @@ def test_wake_up_launches_the_hud_for_a_non_hud_client(
     assert launched == [True]
 
 
+def test_wake_up_spawns_the_briefing_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wake-up speaks the briefing instead of the generic confirmation."""
+    _disable_llm(monkeypatch)
+    ws, conn = _connection()
+    conn.is_hud_client = True
+    spawned: list[bool] = []
+    spoken: list[str] = []
+
+    async def fake_launch() -> None:
+        raise AssertionError("a HUD client must not launch another HUD")
+
+    async def fake_tts(text) -> None:
+        spoken.append(text)
+
+    monkeypatch.setattr(conn, "_launch_hud", fake_launch)
+    monkeypatch.setattr(conn, "_start_tts", fake_tts)
+    monkeypatch.setattr(conn, "_spawn_briefing", lambda: spawned.append(True))
+    monkeypatch.setattr(settings, "briefing_enabled", True)
+    monkeypatch.setattr(settings, "briefing_on_wake_up", True)
+
+    asyncio.run(conn._handle_final_utterance("alvin wake up", 0.95))
+
+    commands = [event for event in ws.json if event.get("type") == "command"]
+    assert commands and commands[0]["intent"] == "wake_up"
+    assert spawned == [True]
+    assert spoken == [], "the briefing task owns the spoken response"
+
+
 def test_laptop_shutdown_powers_off_the_machine_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

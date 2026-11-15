@@ -433,7 +433,7 @@ class SpeakerService:
         await self._save_profiles()
         return True
 
-    async def update_threshold(self, threshold: float) -> None:
+    def update_threshold(self, threshold: float) -> None:
         """Update the similarity threshold for identification."""
         self.similarity_threshold = max(0.0, min(1.0, threshold))
         log.info("Speaker similarity threshold updated to %.3f", self.similarity_threshold)

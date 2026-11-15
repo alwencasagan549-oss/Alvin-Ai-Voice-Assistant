@@ -1168,12 +1168,12 @@ class LLMService:
                 last_user_msg = content if isinstance(content, str) else str(content)
                 break
 
-        # The search gate is deterministic: a question word anywhere in the
-        # user's turn enables web search, while an ordinary conversational
-        # turn does not. An explicit "search the web" override still wins.
-        # In camera mode the gate is bypassed: the LLM decides whether to
-        # search based on the camera frame, so the tool is available but never
-        # forced.
+        # The search gate is deterministic: an explicit "search the web"
+        # request or a live-info hint (latest, news, weather, price…) enables
+        # web search, while an ordinary conversational turn — even one phrased
+        # as a question — does not. In camera mode the gate is bypassed: the
+        # LLM decides whether to search based on the camera frame, so the tool
+        # is available but never forced.
         search_override = _check_voice_override(last_user_msg) if last_user_msg else None
         search_ok = _should_search(last_user_msg) if last_user_msg else False
         force_search = bool(

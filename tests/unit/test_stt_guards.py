@@ -138,9 +138,16 @@ def test_short_audio_uses_the_configured_floor():
     assert breaker_timeout(1.5) == pytest.approx(settings.groq_timeout_sec)
 
 
-def test_long_audio_gets_a_scaled_budget():
+def test_long_audio_gets_a_scaled_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Pin the floor below the scaled value so the test does not depend on the
+    # developer's .env (GROQ_TIMEOUT_SEC may be raised there).
+    monkeypatch.setattr(settings, "groq_timeout_sec", 1.0)
+    monkeypatch.setattr(settings, "groq_timeout_base_sec", 2.0)
+    monkeypatch.setattr(settings, "groq_timeout_slope_sec", 0.2)
+
     budget = breaker_timeout(12.4)
-    expected = settings.groq_timeout_base_sec + 12.4 * settings.groq_timeout_slope_sec
+
+    expected = 2.0 + 12.4 * 0.2
     assert budget == pytest.approx(expected)
     assert budget > settings.groq_timeout_sec
 

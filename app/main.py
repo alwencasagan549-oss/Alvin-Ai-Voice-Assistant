@@ -27,6 +27,7 @@ from fastapi import FastAPI, WebSocket, WebSocketException, status
 from fastapi.responses import JSONResponse
 
 from .audio_pool import shutdown_pools
+from .briefing import briefing_service
 from .config import settings
 from .connection import Connection, manager, verify_token
 from .llm import llm_service
@@ -65,6 +66,8 @@ async def lifespan(app: FastAPI):
         warmup_tasks.append(asyncio.create_task(tts_warm_up()))
     if llm_service.enabled and settings.llm_warmup:
         warmup_tasks.append(asyncio.create_task(llm_service.warm_up()))
+    if settings.briefing_enabled and settings.briefing_warmup:
+        warmup_tasks.append(asyncio.create_task(briefing_service.warm_up()))
 
     if cloud_primary_enabled():
         log.info(
@@ -94,6 +97,14 @@ async def lifespan(app: FastAPI):
         )
     else:
         log.info("LLM brain disabled (set LLM_API_KEY to enable)")
+    if settings.briefing_enabled:
+        log.info(
+            "Wake-up briefing ready: weather=%s tasks=%s email=%s polish=%s",
+            "on" if settings.briefing_weather_enabled else "off",
+            "on" if settings.briefing_tasks_enabled else "off",
+            "on" if settings.briefing_email_enabled else "off",
+            "on" if settings.briefing_llm_polish else "off",
+        )
 
     # Initialize speaker service if enabled
     if settings.speaker_enabled:

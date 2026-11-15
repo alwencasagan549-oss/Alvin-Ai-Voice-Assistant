@@ -44,12 +44,18 @@ os.environ.setdefault("MAX_SEGMENT_SECONDS", "20")
 os.environ.setdefault("GROQ_WARMUP", "false")
 os.environ.setdefault("CF_STT_WARMUP", "false")
 os.environ.setdefault("TTS_WARMUP", "false")
+# The briefing reaches the network at startup and on "wake up"; unit tests
+# monkeypatch the sources they need, so keep the real service out of the way.
+os.environ.setdefault("BRIEFING_ENABLED", "false")
+os.environ.setdefault("BRIEFING_WARMUP", "false")
 # Explicitly disable cloud STT for integration tests (overrides .env)
 os.environ["CF_STT_ENABLED"] = "false"
 os.environ["GROQ_API_KEY"] = ""
 os.environ["GROQ_WARMUP"] = "false"
 os.environ["CF_STT_WARMUP"] = "false"
 os.environ["TTS_WARMUP"] = "false"
+os.environ["BRIEFING_ENABLED"] = "false"
+os.environ["BRIEFING_WARMUP"] = "false"
 
 
 
@@ -91,6 +97,8 @@ def server_url() -> str:
     env["GROQ_WARMUP"] = "false"
     env["CF_STT_WARMUP"] = "false"
     env["TTS_WARMUP"] = "false"
+    env["BRIEFING_ENABLED"] = "false"
+    env["BRIEFING_WARMUP"] = "false"
     # Lower VAD threshold for test audio (attenuated to 55% volume)
     env["VAD_THRESHOLD"] = "0.3"
 

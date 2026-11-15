@@ -281,7 +281,9 @@ def test_importing_app_main_does_not_require_speaker_packages():
         class BlockSpeakerPackages(importlib.abc.MetaPathFinder):
             def find_spec(self, fullname, path=None, target=None):
                 root = fullname.split(".", 1)[0]
-                if root in {"torch", "torchaudio", "speechbrain"}:
+                # torch is required by silero-vad, so only the speaker-only
+                # packages may be absent when app.main is imported.
+                if root in {"torchaudio", "speechbrain"}:
                     raise ModuleNotFoundError(f"blocked optional package: {fullname}")
                 return None
 

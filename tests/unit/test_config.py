@@ -114,6 +114,32 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.llm_max_history_tokens == 2000
     assert settings.transcription_queue_maxsize == 200
     assert settings.audio_worker_threads == 8
+    assert settings.briefing_enabled is True
+    assert settings.briefing_on_wake_up is True
+    assert settings.briefing_warmup is True
+    assert settings.briefing_weather_enabled is True
+    assert settings.briefing_weather_location == "Cagayan de Oro"
+    assert settings.briefing_weather_timeout_sec == 12.0
+    assert settings.briefing_weather_cache_sec == 600.0
+    assert settings.briefing_tasks_enabled is True
+    assert settings.briefing_tasks_token_path == "credentials/google_tasks_token.json"
+    assert settings.briefing_tasks_list == "@default"
+    assert settings.briefing_tasks_count == 5
+    assert settings.briefing_tasks_timeout_sec == 6.0
+    assert settings.briefing_email_enabled is True
+    assert settings.briefing_email_imap_host == "imap.gmail.com"
+    assert settings.briefing_email_imap_port == 993
+    assert settings.briefing_email_imap_user == ""
+    assert settings.briefing_email_imap_password == ""
+    assert settings.briefing_email_folder == "INBOX"
+    assert settings.briefing_email_count == 3
+    assert settings.briefing_email_unread_only is True
+    assert settings.briefing_email_timeout_sec == 8.0
+    assert settings.briefing_email_cache_sec == 120.0
+    assert settings.briefing_email_skip_sensitive is True
+    assert settings.briefing_llm_polish is False
+    assert settings.briefing_llm_max_tokens == 220
+    assert settings.briefing_llm_timeout_sec == 10.0
 
 
 def test_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:

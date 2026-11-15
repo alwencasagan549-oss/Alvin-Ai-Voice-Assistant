@@ -25,8 +25,13 @@ def _service_with_fake_stream(create) -> LLMService:
     settings.llm_api_key = "fake-key"
     settings.llm_enabled = True
     settings.debug = True
+    # Pin the provider chain to the fake Kilo client. Without this the test
+    # would hit the configured Cloudflare/NVIDIA provider, which answers with
+    # a real (and non-deterministic) reply.
+    settings.llm_primary_provider = "kilo"
     settings.llm_use_cf_as_primary = False
     settings.cf_enabled = False
+    settings.nvidia_enabled = False
 
     service = LLMService()
     service._client = _FakeClient(create)
@@ -62,16 +67,15 @@ def test_voice_override_detection(text, expected):
     "text",
     [
         "What is the weather?",
-        "How do I make pasta?",
-        "When is the meeting?",
-        "Who won the game?",
-        "Where is the nearest station?",
-        "If it rains, should I cancel?",
-        "Tell me what the score is",
+        "Tell me the latest news",
+        "What is the price of bitcoin?",
+        "Search for the best pasta recipe",
+        "Look it up",
+        "Google it",
     ],
 )
-def test_question_words_enable_web_search(text):
-    """Any requested question word enables the search tool."""
+def test_live_info_and_explicit_requests_enable_web_search(text):
+    """Only live-info hints and explicit search requests enable the tool."""
     assert _should_search(text) is True
 
 
@@ -82,10 +86,13 @@ def test_question_words_enable_web_search(text):
         "tell me a joke",
         "I am having a good day",
         "Please turn on the lights",
+        "How do I make pasta?",
+        "What is the capital of France?",
+        "When is the meeting?",
     ],
 )
 def test_conversational_turns_do_not_enable_web_search(text):
-    """A turn without a question word stays conversational."""
+    """A question word alone no longer triggers web search."""
     assert _should_search(text) is False
 
 
@@ -122,8 +129,8 @@ async def test_conversational_turn_does_not_offer_web_search():
 
 
 @pytest.mark.asyncio
-async def test_question_word_forces_web_search_tool():
-    """A requested question word requires the web-search function."""
+async def test_live_info_question_forces_web_search_tool():
+    """A live-info question requires the web-search function."""
     calls = []
 
     async def fake_create(messages, **kwargs):
@@ -143,7 +150,7 @@ async def test_question_word_forces_web_search_tool():
     service = _service_with_fake_stream(fake_create)
     messages = [
         {"role": "system", "content": "sys"},
-        {"role": "user", "content": "what is the answer"},
+        {"role": "user", "content": "what is the latest news"},
     ]
 
     with patch(
@@ -213,7 +220,7 @@ async def test_search_tool_call_is_executed():
     service = _service_with_fake_stream(fake_create)
     messages = [
         {"role": "system", "content": "sys"},
-        {"role": "user", "content": "Who won the NBA game last night?"},
+        {"role": "user", "content": "search who won the NBA game last night"},
     ]
 
     with patch("app.llm.web_search", new_callable=AsyncMock, return_value="Mock search result") as mock_search:
@@ -339,7 +346,7 @@ async def test_search_failure_returns_error_message():
     service = _service_with_fake_stream(fake_create)
     messages = [
         {"role": "system", "content": "sys"},
-        {"role": "user", "content": "what is the test result?"},
+        {"role": "user", "content": "search for the test result"},
     ]
 
     with patch("app.llm.web_search", new_callable=AsyncMock, return_value="SEARCH_FAILED: web search is unavailable right now.") as mock_search:

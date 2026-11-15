@@ -26,6 +26,13 @@ htmlcov/
 # --------------------------------------------------------------------------- #
 .env
 
+# Google OAuth client secrets and the token created by
+# scripts/google_tasks_auth.py. These grant access to the user's task list and
+# must never be committed.
+credentials/
+client_secret*.json
+google_tasks_token*.json
+
 # --------------------------------------------------------------------------- #
 # Generated voice previews (~14 MB). Regenerate with:
 #   python scripts/tts_voice_samples.py

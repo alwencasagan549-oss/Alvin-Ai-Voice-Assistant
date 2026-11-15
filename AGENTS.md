@@ -36,6 +36,10 @@ app/
   intents.py     Deterministic device-command registry (~20 intents: stop/mute/volume/lights/media/query_time/wake)
   itn.py         Inverse text normalization (spoken → written form)
   echo.py        Echo / self-trigger suppression
+  briefing.py    Wake-up briefing: greeting, weather, tasks, email, optional LLM polish
+  weather.py     Current conditions (Open-Meteo geocoding + MET Norway, no API key)
+  email_source.py Read-only Gmail IMAP header fetch
+  tasks.py       Google Tasks (read-only OAuth)
   main.py        FastAPI app: GET /health, WS /ws/transcribe
 run.py          Server entrypoint (uvicorn). --mic also opens the live-mic client
 alvin_hud.py    Desktop HUD frontend (PySide6): main window, live transcript,
@@ -55,6 +59,7 @@ scripts/        Benchmark + speaker service + voice-catalogue helpers
                 speaker_service.py — standalone PCM playback service with barge-in
                 tts_voice_samples.py — list voices + render sample MP3s
                 measure_stt_tts_latency.py — manual STT→TT latency benchmark
+                google_tasks_auth.py — one-time OAuth setup for Google Tasks
 ```
 
 ## Protocols
@@ -88,6 +93,7 @@ any size are accepted and buffered. Text frames carry JSON control messages:
   - `{"type": "llm_response", "text": "...", "model": "..."}` — LLM reply
   - `{"type": "llm_error", "error": "..."}` — LLM failure (TTS falls back to raw transcript)
 - Deterministic commands are emitted as `{"type": "command", "intent": "...", "slots": {...}}` events and never reach the LLM.
+- The wake-up briefing is sent as `{"type": "briefing", "text": "...", "greeting": "...", "weather": {...}, "tasks": [...], "emails": [...], "errors": [...]}` before its TTS audio.
 - TTS audio is sent as binary frames; `tts_end` / `tts_error` are JSON.
 
 ### Admission control
@@ -137,7 +143,7 @@ Supported intents:
 | `query_time` | "what time is it", "what's the time", "tell me the time" | — |
 | `open_system` | "open your system", "open system settings", "open your settings", "settings", "control panel" | — |
 | `wake` | "hey alvin", "alvin?", "ok alvin" | — |
-| `wake_up` | any sentence containing "wake up" ("wake up", "alvin wake up", "wake up now") | — (reveals the HUD window; starts one only for a non-HUD client) |
+| `wake_up` | any sentence containing "wake up" ("wake up", "alvin wake up", "wake up now") | — (reveals the HUD fullscreen; starts one only for a non-HUD client) |
 | `show_home` | "go back to homepage", "go home", "show homepage", "focus the app" | — (closes HUD pop-ups and brings the main window to the front) |
 | `shutdown_laptop` | "turn off my laptop", "shut down the computer", "power off my pc" | — (action: powers off the local machine via the OS shutdown command) |
 | `shutdown` | any utterance containing "goodbye" ("alvin goodbye", "I think it is time to say goodbye") | — (action: graceful server stop; never shuts down the OS) |
@@ -158,6 +164,49 @@ Rules:
 - Mic-control intents (`mute_mic` / `unmute_mic`) always speak their hardcoded
   confirmation (`MUTE_RESPONSE_TEXT` / `UNMUTE_RESPONSE_TEXT`), never gated on
   `INTENT_SPEAK_CONFIRMATION`.
+
+## Wake-up briefing
+
+`app.briefing` builds the spoken briefing that follows the `wake_up` intent
+("Alvin, wake up"). The text is assembled from templates outside the LLM, so it
+works with small/free models and keeps a stable order; an optional LLM pass can
+rewrite it. Each source is fetched independently, so a slow or failed source
+adds an error line and the rest of the briefing is still spoken.
+
+Order: time-aware greeting ("Good morning/afternoon/evening, sir" + date and
+12-hour time) → current weather → open tasks → latest email → closing question.
+The session receives a structured `briefing` event before its TTS audio:
+
+```json
+{"type": "briefing", "text": "...", "greeting": "...", "weather": {...}, "tasks": [...], "emails": [...], "errors": [...]}
+```
+
+The briefing is spawned as a background task from the `wake_up` handler
+(`settings.briefing_enabled` and `settings.briefing_on_wake_up`), so gathering
+does not block the audio consumer. It is cancelled if the turn is interrupted
+or the connection closes. Weather and email responses are cached
+(`BRIEFING_WEATHER_CACHE_SEC` 600 s, `BRIEFING_EMAIL_CACHE_SEC` 120 s) and
+prefetched at startup when `BRIEFING_WARMUP=true`.
+
+Sources:
+
+- **Weather** (`app.weather`) — Open-Meteo geocoding resolves
+  `BRIEFING_WEATHER_LOCATION`, MET Norway Locationforecast returns the current
+  temperature and conditions. No API key or signup; CC BY 4.0 data.
+- **Google Tasks** (`app.tasks`) — read-only `tasks.readonly` OAuth via
+  `BRIEFING_TASKS_TOKEN_PATH` (create it with
+  `python scripts/google_tasks_auth.py`). Returns the first
+  `BRIEFING_TASKS_COUNT` open tasks from `BRIEFING_TASKS_LIST`.
+- **Gmail** (`app.email_source`) — read-only IMAP with a Google app password
+  (`BRIEFING_EMAIL_IMAP_USER` / `BRIEFING_EMAIL_IMAP_PASSWORD`). Fetches only
+  `From`/`Subject`/`Date` with `BODY.PEEK`, never the body and never marks mail
+  read. One-time codes, verification, and password-reset subjects are skipped
+  when `BRIEFING_EMAIL_SKIP_SENSITIVE=true`.
+
+Key knobs: `BRIEFING_ENABLED` (default true), `BRIEFING_ON_WAKE_UP` (default
+true), `BRIEFING_WARMUP` (default true), `BRIEFING_LLM_POLISH` (default false),
+`BRIEFING_LLM_MAX_TOKENS` (default 220), `BRIEFING_LLM_TIMEOUT_SEC` (default
+10 s). If polish fails, the templated text is spoken.
 
 ## Web search tool calling
 

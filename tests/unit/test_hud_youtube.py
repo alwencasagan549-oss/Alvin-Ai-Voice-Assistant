@@ -119,6 +119,33 @@ def test_stop_command_terminates_background_player() -> None:
     assert stopped == [True], "'stop the music' must terminate the local player"
 
 
+def test_video_playback_is_fullscreen(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    class FakeProc:
+        def poll(self):
+            return None
+
+        def terminate(self) -> None:
+            pass
+
+        def wait(self, timeout=None) -> None:
+            pass
+
+    def fake_popen(args, **kwargs):
+        calls.append(args)
+        return FakeProc()
+
+    monkeypatch.setattr(hud.subprocess, "Popen", fake_popen)
+
+    window = DummyWindow()
+    ok = hud.AlvinWindow._play_media(window, "https://example.com/direct", False)
+
+    assert ok is True
+    assert "--fullscreen" in calls[0]
+    assert "--no-video" not in calls[0]
+
+
 class FakeSignal:
     def __init__(self) -> None:
         self.emitted: list[tuple] = []

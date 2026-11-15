@@ -40,6 +40,7 @@ import numpy as np
 from fastapi import WebSocket, WebSocketException, status
 from starlette.websockets import WebSocketDisconnect
 
+from .briefing import briefing_service
 from .browser import close_youtube_tab
 from .config import settings
 from .echo import EchoGuard
@@ -312,6 +313,9 @@ class Connection:
         # so a new request cancels the previous one instead of interleaving.
         self.tts_task: asyncio.Task | None = None
         self.llm_task: asyncio.Task | None = None
+        # The wake-up briefing gathers data before it speaks; keep its task so
+        # a barge-in or disconnect can cancel the collection.
+        self.briefing_task: asyncio.Task | None = None
         self.tts_voice = settings.tts_voice
         self.tts_enabled = True  # Per-connection TTS enable/disable
         self.send_lock = asyncio.Lock()
@@ -1444,7 +1448,9 @@ class Connection:
             })
             if not self.is_hud_client:
                 await self._launch_hud()
-            if match.confirmation:
+            if settings.briefing_enabled and settings.briefing_on_wake_up:
+                self._spawn_briefing()
+            elif match.confirmation:
                 await self._start_tts(match.confirmation)
             return
         if match.intent == "show_dashboard":
@@ -1970,6 +1976,13 @@ class Connection:
         playback -- otherwise barge-in cancels the server-side generation while
         the client keeps draining already-buffered PCM.
         """
+        # Stop a briefing that is still gathering data. The briefing detaches
+        # itself before speaking, so this cannot cancel the task that is
+        # currently driving TTS.
+        briefing_task, self.briefing_task = self.briefing_task, None
+        if briefing_task is not None and not briefing_task.done():
+            briefing_task.cancel()
+
         had_turn = (self.tts_task is not None and not self.tts_task.done()) or (
             self.llm_task is not None and not self.llm_task.done()
         )
@@ -2288,6 +2301,40 @@ class Connection:
     # ------------------------------------------------------------------ #
     # Speech output
     # ------------------------------------------------------------------ #
+    def _spawn_briefing(self) -> None:
+        """Start the wake-up briefing without blocking the audio consumer."""
+        if self.briefing_task is not None and not self.briefing_task.done():
+            return
+        self.briefing_task = asyncio.create_task(self._deliver_briefing())
+        self.briefing_task.add_done_callback(
+            lambda task: self._observe_background_task(task, "wake-up briefing")
+        )
+
+    async def _deliver_briefing(self) -> None:
+        """Build, display, and speak the wake-up briefing.
+
+        The structured ``briefing`` event is sent before synthesis starts so the
+        HUD can render the headlines, tasks, and messages while Alvin talks.
+        """
+        try:
+            data = await briefing_service.build()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("wake-up briefing failed")
+            self.briefing_task = None
+            await self._start_tts("Waking up for you, sir.")
+            return
+
+        # Detach before _start_tts: its cancellation path must not cancel the
+        # task that is currently speaking.
+        self.briefing_task = None
+        text = (data.spoken_text or "").strip() or "Waking up for you, sir."
+        data.spoken_text = text
+        await self._send_raw(data.to_event())
+        self.history.append({"role": "assistant", "content": text})
+        await self._start_tts(text)
+
     async def _start_tts(self, text: str, voice: str | None = None) -> None:
         """(Re)start speech synthesis, cancelling anything already playing."""
         if not self.tts_enabled:

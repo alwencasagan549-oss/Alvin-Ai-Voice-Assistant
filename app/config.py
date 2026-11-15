@@ -105,7 +105,8 @@ ENV_VAR_NAMES = [
     "PUSH_TO_TALK_TIMEOUT_MS",
     "PUSH_TO_TALK_ECHO_GATE",
     "API_KEY|SERVICE_AUTH_TOKEN",
-    "LLM_API_KEY|NVIDIA_API_KEY",
+    "LLM_API_KEY",
+    "NVIDIA_API_KEY",
     "NVIDIA_BASE_URL",
     "NVIDIA_MODEL",
     "NVIDIA_VISION_MODEL",
@@ -155,6 +156,32 @@ ENV_VAR_NAMES = [
     "LAPTOP_SHUTDOWN_DELAY_SEC",
     "YOUTUBE_ADFREE",
     "YOUTUBE_AUDIO_ONLY",
+    "BRIEFING_ENABLED",
+    "BRIEFING_ON_WAKE_UP",
+    "BRIEFING_WARMUP",
+    "BRIEFING_WEATHER_ENABLED",
+    "BRIEFING_WEATHER_LOCATION",
+    "BRIEFING_WEATHER_TIMEOUT_SEC",
+    "BRIEFING_WEATHER_CACHE_SEC",
+    "BRIEFING_TASKS_ENABLED",
+    "BRIEFING_TASKS_TOKEN_PATH",
+    "BRIEFING_TASKS_LIST",
+    "BRIEFING_TASKS_COUNT",
+    "BRIEFING_TASKS_TIMEOUT_SEC",
+    "BRIEFING_EMAIL_ENABLED",
+    "BRIEFING_EMAIL_IMAP_HOST",
+    "BRIEFING_EMAIL_IMAP_PORT",
+    "BRIEFING_EMAIL_IMAP_USER",
+    "BRIEFING_EMAIL_IMAP_PASSWORD",
+    "BRIEFING_EMAIL_FOLDER",
+    "BRIEFING_EMAIL_COUNT",
+    "BRIEFING_EMAIL_UNREAD_ONLY",
+    "BRIEFING_EMAIL_TIMEOUT_SEC",
+    "BRIEFING_EMAIL_CACHE_SEC",
+    "BRIEFING_EMAIL_SKIP_SENSITIVE",
+    "BRIEFING_LLM_POLISH",
+    "BRIEFING_LLM_MAX_TOKENS",
+    "BRIEFING_LLM_TIMEOUT_SEC",
 ]
 
 _NONE = {"", "auto", "none", "null"}
@@ -520,6 +547,108 @@ class Settings:
     # show the video in the local player window.
     youtube_audio_only: bool = field(
         default_factory=lambda: _env_bool("YOUTUBE_AUDIO_ONLY", True)
+    )
+
+    # --- wake-up briefing ------------------------------------------------------ #
+    # "Alvin, wake up" speaks a time-aware greeting, current weather, open
+    # Google Tasks, and the latest Gmail message. Each source is independent:
+    # a disabled or failing source is skipped instead of preventing the rest.
+    briefing_enabled: bool = field(
+        default_factory=lambda: _env_bool("BRIEFING_ENABLED", True)
+    )
+    briefing_on_wake_up: bool = field(
+        default_factory=lambda: _env_bool("BRIEFING_ON_WAKE_UP", True)
+    )
+    # Fetch weather and email in the background at startup so the first
+    # wake-up does not wait on the network.
+    briefing_warmup: bool = field(
+        default_factory=lambda: _env_bool("BRIEFING_WARMUP", True)
+    )
+
+    # Current weather (free, no API key): Open-Meteo resolves the place name,
+    # MET Norway returns the forecast.
+    briefing_weather_enabled: bool = field(
+        default_factory=lambda: _env_bool("BRIEFING_WEATHER_ENABLED", True)
+    )
+    briefing_weather_location: str = field(
+        default_factory=lambda: _env("BRIEFING_WEATHER_LOCATION", "Cagayan de Oro")
+    )
+    briefing_weather_timeout_sec: float = field(
+        default_factory=lambda: _env_float("BRIEFING_WEATHER_TIMEOUT_SEC", 12.0)
+    )
+    briefing_weather_cache_sec: float = field(
+        default_factory=lambda: _env_float("BRIEFING_WEATHER_CACHE_SEC", 600.0)
+    )
+
+    # Google Tasks (read-only OAuth). On by default; run
+    # scripts/google_tasks_auth.py once to create the token.
+    briefing_tasks_enabled: bool = field(
+        default_factory=lambda: _env_bool("BRIEFING_TASKS_ENABLED", True)
+    )
+    briefing_tasks_token_path: str = field(
+        default_factory=lambda: _env(
+            "BRIEFING_TASKS_TOKEN_PATH", "credentials/google_tasks_token.json"
+        )
+    )
+    briefing_tasks_list: str = field(
+        default_factory=lambda: _env("BRIEFING_TASKS_LIST", "@default")
+    )
+    briefing_tasks_count: int = field(
+        default_factory=lambda: _env_int("BRIEFING_TASKS_COUNT", 5)
+    )
+    briefing_tasks_timeout_sec: float = field(
+        default_factory=lambda: _env_float("BRIEFING_TASKS_TIMEOUT_SEC", 6.0)
+    )
+
+    # Gmail over IMAP. Headers only, read-only, never marks messages as read.
+    # On by default once BRIEFING_EMAIL_IMAP_USER / PASSWORD are set; Gmail
+    # requires 2-Step Verification and an App Password.
+    briefing_email_enabled: bool = field(
+        default_factory=lambda: _env_bool("BRIEFING_EMAIL_ENABLED", True)
+    )
+    briefing_email_imap_host: str = field(
+        default_factory=lambda: _env("BRIEFING_EMAIL_IMAP_HOST", "imap.gmail.com")
+    )
+    briefing_email_imap_port: int = field(
+        default_factory=lambda: _env_int("BRIEFING_EMAIL_IMAP_PORT", 993)
+    )
+    briefing_email_imap_user: str = field(
+        default_factory=lambda: _env("BRIEFING_EMAIL_IMAP_USER", "")
+    )
+    briefing_email_imap_password: str = field(
+        default_factory=lambda: _env("BRIEFING_EMAIL_IMAP_PASSWORD", "")
+    )
+    briefing_email_folder: str = field(
+        default_factory=lambda: _env("BRIEFING_EMAIL_FOLDER", "INBOX")
+    )
+    briefing_email_count: int = field(
+        default_factory=lambda: _env_int("BRIEFING_EMAIL_COUNT", 3)
+    )
+    briefing_email_unread_only: bool = field(
+        default_factory=lambda: _env_bool("BRIEFING_EMAIL_UNREAD_ONLY", True)
+    )
+    briefing_email_timeout_sec: float = field(
+        default_factory=lambda: _env_float("BRIEFING_EMAIL_TIMEOUT_SEC", 8.0)
+    )
+    briefing_email_cache_sec: float = field(
+        default_factory=lambda: _env_float("BRIEFING_EMAIL_CACHE_SEC", 120.0)
+    )
+    # Keep one-time codes and password-reset mail out of the spoken briefing.
+    briefing_email_skip_sensitive: bool = field(
+        default_factory=lambda: _env_bool("BRIEFING_EMAIL_SKIP_SENSITIVE", True)
+    )
+
+    # Optional LLM rewrite of the templated briefing. When enabled, the
+    # briefing text (including email subjects and senders) is sent to the
+    # configured LLM provider.
+    briefing_llm_polish: bool = field(
+        default_factory=lambda: _env_bool("BRIEFING_LLM_POLISH", False)
+    )
+    briefing_llm_max_tokens: int = field(
+        default_factory=lambda: _env_int("BRIEFING_LLM_MAX_TOKENS", 220)
+    )
+    briefing_llm_timeout_sec: float = field(
+        default_factory=lambda: _env_float("BRIEFING_LLM_TIMEOUT_SEC", 10.0)
     )
 
     @property
