@@ -1,16 +1,31 @@
 # Alvin AI Voice Assistant
 
-A low-latency, real-time voice assistant. Speak into your microphone and Alvin
-transcribes you, thinks with a large language model, and talks back — all
-over a live WebSocket, with interruption (barge-in) support.
+**Current release: v1.1.1**
+
+A low-latency, real-time voice assistant with a J.A.R.V.I.S.-style holographic
+desktop UI. Speak into your microphone and Alvin transcribes you, thinks with a
+large language model, and talks back — all over a live WebSocket, with
+interruption (barge-in) support.
 
 ```
- You speak ──► VAD ──► STT (Groq cloud + local fallback) ──► LLM (Kilo AI / Cloudflare) ──► TTS ──► Alvin speaks
-              (silero)            (whisper-large-v3-turbo / faster-whisper)   (sentence-streamed)   (edge-tts, streamed)
+ You speak ──► VAD ──► STT (Cloudflare / Groq + local fallback) ──► LLM (Cloudflare / Kilo / NVIDIA) ──► TTS ──► Alvin speaks
+              (silero)      (whisper-large-v3-turbo / faster-whisper)      (sentence-streamed)          (edge-tts → Piper, streamed)
 ```
 
 The whole pipeline runs in Python over a single WebSocket. Sentences are spoken
 as soon as the LLM finishes writing them, so short replies come back fast.
+
+Alvin also includes:
+
+- A PySide6 holographic HUD (`alvin_hud.py`) that can start hidden and appear
+  when you say **"Alvin, wake up"**.
+- A React dashboard (`alvin-ai-dashboard/`) for status, settings, and vision.
+- Deterministic voice intents for media, microphone, volume, lights, apps,
+  camera, YouTube, shutdown, and more.
+- Ad-free YouTube playback through `yt-dlp` and a local player, with browser
+  fallback.
+- Web search tool calling, echo suppression, push-to-talk, and optional speaker
+  identification.
 
 ---
 
@@ -19,21 +34,25 @@ as soon as the LLM finishes writing them, so short replies come back fast.
 - **Python 3.12** — [download](https://www.python.org/downloads/). On Windows,
   tick **"Add python.exe to PATH"** during install.
 - **A microphone and speakers.**
-- **API keys** (all free to start — see [Getting the keys](#getting-the-keys)):
-  - **Groq** — primary speech-to-text
-  - **Kilo AI** — conversational LLM brain (get your key from the Kilo AI dashboard)
-  - *(optional)* **Cloudflare Workers AI** — alternate LLM provider; becomes
-    primary when `LLM_USE_CF_AS_PRIMARY=true`
-  - *(optional)* **Tavily** — web search tool calling; DuckDuckGo is the key-free fallback
-- Speech-to-text and text-to-speech also fall back to local / key-less paths,
-  so the assistant still works even if one cloud provider is down.
+- **At least one LLM provider key**:
+  - **Cloudflare Workers AI** — default primary (free tier)
+  - **Kilo AI** — fallback provider
+  - *(optional)* **NVIDIA NIM** — extra fallback
+- **Speech-to-text keys are optional**: Groq is the default cloud provider,
+  Cloudflare Workers AI can be primary instead, and local `faster-whisper`
+  remains the offline fallback.
+- **Node.js + npm** only if you want the React dashboard.
+- **VLC, mpv, or ffplay** only if you want local ad-free YouTube playback;
+  without one, videos open in the browser.
+
+See [Getting the keys](#getting-the-keys) for the full list.
 
 ---
 
-## Run it on a new laptop (step by step)
+## Quick start (Windows)
 
-> This guide assumes Windows with **PowerShell** or **Git Bash**. Adjust the
-> command separator for your shell (`&&` works in both for these commands).
+> This guide assumes Windows with **PowerShell** or **Git Bash**. The commands
+> work in both.
 
 ### 1. Install Python 3.12
 
@@ -65,12 +84,17 @@ pip install -r requirements.txt
 ```
 
 This pulls FastAPI, uvicorn, faster-whisper, silero-vad, edge-tts, miniaudio,
-Groq, OpenAI, `sounddevice`, and `websockets`. No **ffmpeg** install is needed —
-MP3 decoding is done in-process by `miniaudio` and Opus encoding by `soundfile`.
+Groq, OpenAI, `sounddevice`, `websockets`, `PySide6`, `ddgs`, and `yt-dlp`.
+No **ffmpeg** install is needed — MP3 decoding is done in-process by
+`miniaudio` and Opus encoding by `soundfile`.
 
-Speaker identification is optional and off by default. To enable it, install its
-separate dependencies with `pip install -r requirements-speaker.txt`, then set
-`SPEAKER_ENABLED=true` in `.env`.
+Speaker identification is optional and off by default. Its extras are large
+(~2 GB) and are not part of `requirements.txt`. To enable it:
+
+```bash
+pip install speechbrain torch torchaudio
+# then set SPEAKER_ENABLED=true in .env
+```
 
 ### 4. Configure the environment
 
@@ -83,11 +107,22 @@ copy .env.example .env
 cp .env.example .env
 ```
 
-Open `.env` and set at least the keys you plan to use:
+Open `.env` and set at least one LLM provider:
+
+```ini
+# Cloudflare Workers AI (default primary)
+CF_API_KEY=...
+CF_ACCOUNT_ID=...
+
+# and/or Kilo AI
+LLM_API_KEY=...
+```
+
+`GROQ_API_KEY` is optional but recommended as the default speech-to-text
+provider:
 
 ```ini
 GROQ_API_KEY=gsk_....            # from https://console.groq.com/keys
-LLM_API_KEY=...                  # from the Kilo AI dashboard
 ```
 
 Everything else has a working default. See [Getting the keys](#getting-the-keys)
@@ -97,45 +132,36 @@ and [Configuration](#configuration) for the full list.
 
 ### 5. Start Alvin and talk to it
 
-One command boots the server **and** opens the live microphone client:
+The normal Windows launch is:
+
+```bat
+start.bat
+```
+
+`start.bat` starts the backend and launches the **holographic HUD hidden**, so
+nothing pops up on launch. The microphone stays live in the background. Say
+**"Alvin, wake up"** to reveal the HUD.
+
+The backend listens on `http://localhost:8000`; the HUD connects to
+`ws://127.0.0.1:8000/ws/transcribe`.
+
+Other launcher options:
 
 ```bash
+# Visible HUD
+python run-all.py --hud
+
+# Hidden HUD (same behavior as start.bat)
+python run-all.py --hud --hidden
+
+# Backend only
+python run-all.py
+
+# Backend + terminal mic client, no HUD
 python run.py --mic
 ```
 
-#### Run the backend + dashboard together (one command)
-
-To start **both** the FastAPI backend and the React dashboard UI together:
-
-```bash
-# Windows (PowerShell):
-python run-all.py
-
-# macOS / Linux:
-./start-all.sh   # or: python3 run-all.py
-```
-
-- Backend starts on `http://localhost:8000` and is waited on until `/health` responds.
-- Dashboard starts on `http://localhost:5173` (served by Vite with a proxy to the backend).
-- Press `Ctrl+C` to stop both cleanly.
-
-You can also start them separately if you prefer:
-
-```bash
-# Terminal 1 — backend:
-python run.py
-
-# Terminal 2 — dashboard:
-cd alvin-ai-dashboard
-npm install
-npm run dev
-```
-
-Wait for `Server ready.`, then just start speaking. Say something, pause for
-about half a second, and Alvin will answer out loud. Talk over Alvin at any
-time to interrupt it. Press <kbd>Ctrl</kbd>+<kbd>C</kbd> to stop.
-
-Useful flags:
+Useful `run.py` flags:
 
 ```bash
 python run.py --mic --voice en-US-AndrewNeural   # pick a different voice
@@ -145,9 +171,13 @@ python run.py --mic --ptt-mode global            # hold Shift+Z to speak
 python run.py --mic --ptt-mode console           # press Enter to speak (no admin)
 ```
 
-Push-to-talk (PTT): with `--ptt-mode global` you hold **Shift+Z** while speaking;
-with `--ptt-mode console` you press **Enter** to toggle. While PTT is active,
-audio is captured and processed; otherwise the mic is idle.
+Push-to-talk (PTT): with `--ptt-mode global` you hold **Shift+Z** while
+speaking; with `--ptt-mode console` you press **Enter** to toggle. While PTT is
+active, audio is captured and processed; otherwise the mic is idle.
+
+Wait for `Server ready.`, then start speaking. Say something, pause for about
+half a second, and Alvin will answer out loud. Talk over Alvin at any time to
+interrupt it. Press <kbd>Ctrl</kbd>+<kbd>C</kbd> to stop.
 
 <details>
 <summary>Run the server and a client separately</summary>
@@ -168,9 +198,26 @@ python tests/manual/stream_mic.py --url ws://HOST:8000/ws/transcribe
 
 </details>
 
-### 6. (Optional) Verify with the test suite
+### 6. Optional: run the React dashboard
+
+The dashboard is **not** started automatically by `run-all.py`. Start it
+manually:
 
 ```bash
+cd alvin-ai-dashboard
+npm install
+npm run dev
+```
+
+It is served at `http://localhost:5173` with a Vite proxy to the backend.
+
+You can also say **"Alvin, show dashboard"** — the backend starts the dev
+server on demand (requires `npm`) and opens it in your browser.
+
+### 7. Optional: verify with the test suite
+
+```bash
+pip install pytest pytest-asyncio
 python -m pytest -q
 ```
 
@@ -183,28 +230,60 @@ so they need no microphone.
 
 | Provider | Purpose | Where to get it | Env var |
 |----------|---------|-----------------|---------|
-| **Groq** | Primary speech-to-text | https://console.groq.com/keys | `GROQ_API_KEY` |
-| **Kilo AI** | Conversational LLM brain | Kilo AI dashboard | `LLM_API_KEY` (alias `NVIDIA_API_KEY`) |
-| **Cloudflare Workers AI** *(optional)* | Alternate LLM provider; primary when `LLM_USE_CF_AS_PRIMARY=true` | https://dash.cloudflare.com/ → API Tokens | `CF_API_KEY` + `CF_ACCOUNT_ID` |
-| **Gemini** *(optional)* | Web search via Google Search grounding | https://aistudio.google.com/apikey | `GEMINI_API_KEY` |
-| **edge-tts** | Text-to-speech | None needed — uses Microsoft's online voice endpoint | — |
-| **DuckDuckGo** *(optional)* | Key-free web search fallback | None needed | — |
+| **Cloudflare Workers AI** | LLM (default primary) + optional STT | https://dash.cloudflare.com/ → API Tokens | `CF_API_KEY` + `CF_ACCOUNT_ID` |
+| **Kilo AI** | LLM fallback | Kilo AI dashboard | `LLM_API_KEY` |
+| **Groq** | Default speech-to-text | https://console.groq.com/keys | `GROQ_API_KEY` |
+| **NVIDIA NIM** *(optional)* | Extra LLM provider | https://build.nvidia.com | `NVIDIA_API_KEY`, `NVIDIA_ENABLED=true` |
+| **Tavily** *(optional)* | Web search tool | https://tavily.com | `TAVILY_API_KEY` |
+| **DuckDuckGo** | Key-free web search fallback | None needed | — |
+| **edge-tts** | Text-to-speech | None needed — online Microsoft voice endpoint | — |
+| **Piper** | Local TTS fallback | None needed after model download | — |
+| **yt-dlp** | YouTube search + stream resolution | None needed | — |
 
-- **If you don't set `LLM_API_KEY`**, the LLM is disabled: Alvin will still
-  transcribe you, and (if `TTS_AUTO_SPEAK=true`) simply speak the raw transcript
-  back instead of a generated reply. `TTS_AUTO_SPEAK` only takes effect when the
-  LLM is disabled — with an LLM configured, replies are spoken from the model's
-  output and the toggle is left to the client's Voice replies switch.
-- **If you don't set `GROQ_API_KEY`**, every transcription falls back to the
-  local `faster-whisper` model (slower, but works offline).
-- **Web search** is enabled when `GEMINI_API_KEY` is set; otherwise DuckDuckGo
-  is used as a key-free fallback. Question-style utterances containing
-  **what, how, when, who, where, or if** automatically request a web search;
-  ordinary conversation does not. Alvin says "Let me check that on the web, sir."
-  before delivering the searched answer.
-- **Cloudflare-as-primary** is on by default (`LLM_USE_CF_AS_PRIMARY=true`),
-  so Cloudflare is tried first and Kilo AI is the fallback. Set it to `false`
-  to make Kilo AI primary.
+- **LLM providers** are tried in order. `LLM_PRIMARY_PROVIDER=cf` is the default,
+  and the fallback chain is Cloudflare → NVIDIA → Kilo. At least one provider
+  must be configured. If none is, the LLM is disabled: Alvin still transcribes
+  you and, when `TTS_AUTO_SPEAK=true`, speaks the raw transcript back.
+- **Speech-to-text** uses Groq as primary by default. Set
+  `CF_STT_USE_AS_PRIMARY=true` to make Cloudflare Workers AI primary instead.
+  Local `faster-whisper` is the offline fallback.
+- **Web search** runs Tavily (when a key is configured) and DuckDuckGo
+  concurrently, keeps whichever returns usable results, and caches results for
+  5 minutes. Alvin searches when you explicitly ask ("search for…", "look it
+  up", "google it") or when the utterance contains a live-info hint such as
+  **latest, news, weather, or price**. Small talk and math questions do not
+  trigger a search.
+- **Cloudflare as LLM primary** is on by default. Set
+  `LLM_PRIMARY_PROVIDER=kilo` to make Kilo AI primary.
+
+---
+
+## Voice commands
+
+Commands are matched deterministically after inverse text normalization, so
+they do not cost an LLM round-trip. `WAKE_WORD_REQUIRED=false` by default, so
+you can say the command with or without "Alvin".
+
+| Say | Does |
+|-----|------|
+| "Alvin, wake up" | Reveals the hidden HUD |
+| "stop" / "pause" / "resume" | Controls playback |
+| "mute" / "unmute the mic" | Toggles microphone transcription |
+| "volume up" / "set volume to 50" | Volume control |
+| "turn on the lights" / "turn off the lights" | Lights intent |
+| "play <song> on YouTube" | Resolves and plays a stream |
+| "next" / "previous" | YouTube track control |
+| "show dashboard" | Starts and opens the React dashboard |
+| "open your system" / "open VS Code" / "open apps" | Opens the matching window |
+| "open camera" / "close camera" / "what do you see" | Camera and vision |
+| "what time is it" | Speaks the local time |
+| "go back to homepage" | Returns the HUD to its main window |
+| "goodbye" | Shuts down the assistant server |
+| "turn off my laptop" | Starts the OS shutdown countdown |
+
+The full registry lives in `app/intents.py`. The shutdown and laptop-shutdown
+response texts are configurable in `.env`; other confirmations are constants in
+that module.
 
 ---
 
@@ -218,30 +297,33 @@ commented list). The ones you'll most often touch:
 | `HOST` | `127.0.0.1` | Server bind address. Set an API key before binding to a shared network. |
 | `PORT` | `8000` | Server port |
 | `TTS_VOICE` | `en-US-AndrewNeural` | Which voice Alvin speaks with |
-| `VAD_THRESHOLD` | `0.5` | Speech-detection sensitivity. Raise to `0.6+` in noisy rooms / to reduce false barge-in |
-| `SILENCE_THRESHOLD_DBFS` | `-55.0` | Buffers quieter than this never reach an STT backend |
-| `GROQ_TIMEOUT_SEC` | `1.5` | Cloud STT breaker floor (seconds) |
-| `FALLBACK_MODEL` | `base.en` | Local faster-whisper model used when Groq times out / errors |
+| `VAD_THRESHOLD` | `0.65` | Speech-detection sensitivity. Raise it in noisy rooms / to reduce false barge-in |
+| `SILENCE_THRESHOLD_DBFS` | `-45.0` | Buffers quieter than this never reach an STT backend |
+| `GROQ_MODEL` | `whisper-large-v3-turbo` | Groq speech-to-text model |
+| `GROQ_TIMEOUT_SEC` | `5.0` | Cloud STT breaker floor (seconds) |
+| `CF_STT_ENABLED` | `true` | Enable Cloudflare Workers AI as an STT backend |
+| `CF_STT_USE_AS_PRIMARY` | `false` | Make Cloudflare the primary STT provider |
+| `LLM_PRIMARY_PROVIDER` | `cf` | `cf`, `nvidia`, or `kilo` |
 | `LLM_MODEL` | `nvidia/nemotron-3.5-lightning:free` | LLM model on the Kilo AI gateway |
 | `LLM_BASE_URL` | `https://api.kilo.ai/api/gateway` | Kilo AI gateway endpoint |
-| `LLM_USE_CF_AS_PRIMARY` | `true` | When true, Cloudflare Workers AI is the primary LLM provider |
-| `LLM_MAX_TOKENS` | `300` | Reply length cap |
-| `LLM_TIMEOUT_SEC` | `15.0` | Per-call LLM timeout |
-| `TTS_PREFETCH` | `3` | Sentences fetched ahead of the consumer |
-| `TTS_SENTENCE_GAP_MS` | `80` | Digital silence between trimmed sentences |
-| `TTS_TIMEOUT_SEC` | `4.0` | Per-sentence edge-tts fetch timeout |
+| `LLM_MAX_TOKENS` | `200` | Reply length cap |
+| `LLM_TIMEOUT_SEC` | `8.0` | Per-call LLM timeout |
+| `TTS_PREFETCH` | `4` | Sentences fetched ahead of the consumer |
+| `TTS_SENTENCE_GAP_MS` | `30` | Digital silence between trimmed sentences |
+| `TTS_TIMEOUT_SEC` | `20.0` | Per-sentence edge-tts fetch timeout |
 | `API_KEY` | *(empty)* | When set, clients must present it. Empty is suitable only for loopback use. |
-| `INTENT_ENABLED` | `true` | Deterministic device-command routing (stop/mute/volume/lights/...) |
+| `INTENT_ENABLED` | `true` | Deterministic device-command routing |
 | `WAKE_WORDS` | `alvin` | Words that arm the command router |
 | `WAKE_WORD_REQUIRED` | `false` | Require the wake word before a command executes |
-| `PUSH_TO_TALK` | `false` | Wake-word gating state; set by `{"type": "talk", "active": ...}` |
+| `WAKE_WORD_WINDOW_SEC` | `0.0` | Seconds the command router stays armed after a wake word |
+| `WAKE_SPEAK_ACK` | `true` | Speak "Yes?" when only the wake word is said |
 | `ECHO_MODE` | `filter` | `"gate"` = drop mic audio during playback, `"filter"` = drop echoes, `"off"` = disable |
-| `GEMINI_API_KEY` | *(empty)* | Google Gemini API key for web search; unset → DuckDuckGo fallback |
+| `TAVILY_API_KEY` | *(empty)* | Tavily web search key; `GEMINI_API_KEY` is accepted as a fallback alias. Unset → DuckDuckGo only |
 | `SPEAKER_ENABLED` | `false` | Enable speaker identification using ECAPA-TDNN embeddings |
-| `SPEAKER_SIMILARITY_THRESHOLD` | `0.75` | Cosine similarity threshold for speaker matching (0-1) |
-| `SPEAKER_MIN_IDENTIFY_SEC` | `1.0` | Minimum audio duration for identification (seconds) |
-| `SPEAKER_MAX_IDENTIFY_SEC` | `5.0` | Maximum audio duration for identification (seconds) |
-| `SPEAKER_PROFILES_PATH` | `speaker_profiles.pkl` | Path to persist speaker profiles |
+| `YOUTUBE_ADFREE` | `true` | Resolve a direct stream for ad-free playback |
+| `YOUTUBE_AUDIO_ONLY` | `true` | Audio-only playback (less bandwidth, faster start) |
+| `SHUTDOWN_DELAY_SEC` | `3.0` | Delay after the spoken goodbye before the server stops |
+| `LAPTOP_SHUTDOWN_DELAY_SEC` | `10` | Windows shutdown countdown |
 
 Full details, the WebSocket protocol, and the STT/LLM/TTS internals live in
 [AGENTS.md](AGENTS.md).
@@ -250,8 +332,8 @@ Full details, the WebSocket protocol, and the STT/LLM/TTS internals live in
 
 A turn is four serial stages — VAD end-of-turn wait (~0.5 s), STT (~1 s), LLM
 (1–2 s, the biggest chunk), and TTS first audio (~1 s warm). `TTS_WARMUP`,
-`GROQ_WARMUP`, and `LLM_WARMUP` (all on by default) remove the one-time
-cold-start cost from your first real turn.
+`GROQ_WARMUP`, `CF_STT_WARMUP`, and `LLM_WARMUP` (all on by default) remove the
+one-time cold-start cost from your first real turn.
 
 ---
 
@@ -261,18 +343,26 @@ cold-start cost from your first real turn.
 app/
   config.py       Settings loaded from the environment / .env
   vad.py          Streaming VAD wrapper (silero, 32 ms frames)
-  stt.py          STTService — Groq cloud primary + local faster-whisper fallback
-  llm.py          LLMService — Kilo AI gateway primary + Cloudflare fallback, web search tool calling
-  tts.py          edge-tts, sentence-chunked 16 kHz PCM streaming (with retry)
+  stt.py          STTService — Groq / Cloudflare primary + local faster-whisper fallback
+  llm.py          LLMService — Cloudflare / NVIDIA / Kilo failover, web search tool calling
+  tts.py          edge-tts, sentence-chunked 16 kHz PCM streaming, Piper fallback
   speaker.py      Speaker identification — ECAPA-TDNN embeddings (enrollment + real-time ID)
   connection.py   Per-connection state machine (VAD feed, JSON events, barge-in, PTT, echo guard)
-  intents.py      Deterministic device-command registry (~20 intents)
+  intents.py      Deterministic device-command registry and wake-word router
   itn.py          Inverse text normalization (spoken → written form)
   echo.py         Echo / self-trigger suppression
+  web_search.py   Tavily + DuckDuckGo search with a 5-minute cache
+  youtube.py      yt-dlp search and stream resolution
+  browser.py      Windows browser-tab automation for YouTube stop
+  audio_pool.py   Bounded worker pools for Opus encode, MP3 decode, Piper, embeddings
   main.py         FastAPI app: GET /health, WS /ws/transcribe
+alvin_hud.py      PySide6 holographic HUD (hidden-start wake-up flow)
 run.py            Server entrypoint (uvicorn); --mic also opens the live-mic client
+run-all.py        Combined launcher: backend + optional HUD / mic
+start.bat         Windows one-click launcher (HUD hidden until "Alvin, wake up")
+alvin-ai-dashboard/  React + Vite dashboard
 tests/            unit / integration / manual-client suites
-scripts/          Benchmark + speaker service + voice-catalogue helpers
+scripts/          Benchmarks, speaker CLI, voice catalogue, shared audio playback
 .env.example      Sample configuration (copy to .env)
 ```
 
@@ -283,6 +373,7 @@ Scripts:
 - `scripts/speaker_enroll.py` — speaker enrollment CLI (enroll, list, delete, identify)
 - `scripts/tts_voice_samples.py` — list voices + render sample MP3s to `voice_samples/`
 - `scripts/measure_stt_tts_latency.py` — manual STT→TT latency benchmark
+- `scripts/audio_playback.py` — shared low-latency playback engine
 
 ---
 
@@ -291,6 +382,9 @@ Scripts:
 - **First run downloads a Whisper model** (the local fallback) into
   `~/.cache/huggingface`. That one-time download happens before the first
   fallback transcription.
+- **The HUD does not appear at launch.** That is intentional with `start.bat`:
+  it starts hidden. Say **"Alvin, wake up"** or run `python run-all.py --hud` to
+  show it immediately.
 - **Muting the mic:** saying "mute" (or "unmute the mic") sets
   `mute_mic`/`unmute_mic` on the server. In `mute_mic` mode the client keeps the
   microphone stream open but the server stops sending its audio to the STT
@@ -301,7 +395,24 @@ Scripts:
 - **No audio out?** Check that your default playback device is correct and that
   nothing else has the device exclusive. The mic client prints `[event]` lines
   for every server message, which is the quickest way to see what's happening.
+- **Dashboard does not load.** It is a separate Vite dev server. Run
+  `npm install` and `npm run dev` in `alvin-ai-dashboard/`, or say
+  "Alvin, show dashboard" and make sure `npm` is on `PATH`.
+- **YouTube opens in a browser instead of playing locally.** Install VLC, mpv,
+  or ffplay so `yt-dlp` can resolve and play the stream; otherwise Alvin falls
+  back to the watch page.
 - **Server not reachable from another machine?** Set `HOST=0.0.0.0`, configure
   `API_KEY`, check your firewall, and use the right `ws://` host:port.
 - **Regenerate the voice previews** (not committed, ~14 MB):
   `python scripts/tts_voice_samples.py` → writes to `voice_samples/`.
+
+---
+
+## Roadmap
+
+The next planned feature is a **wake-up briefing**. On "Alvin, wake up", Alvin
+will greet you based on the time of day, read a short summary of trending
+technology news, list your tasks, and summarize your latest email. The agreed
+design uses Gmail over IMAP (headers only), Google Tasks, and templated speech
+with an optional LLM-polish toggle. This is **not implemented in v1.1.1**; the
+current release is the working baseline.
